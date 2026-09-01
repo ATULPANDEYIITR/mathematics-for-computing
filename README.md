@@ -37,7 +37,7 @@ Optimization
 
 Mathematical Foundations for AI/ML
 
-# Day 01: Number Systems Basics
+# Day 00: Number Systems Basics
 
 ## Objective
 
@@ -77,9 +77,3 @@ Computers use different number systems to represent, store, and process informat
 ## Learning Approach
 
 Number Systems will be covered gradually, starting with basic concepts and progressing toward Binary, Octal, Hexadecimal, number conversions, and their applications in computing.
-
-## Day 01 Completed
-
-**Focus:** Fundamentals of Numbers and Decimal Representation
-
-**Next:** Continue with the next concepts in Number Systems.
