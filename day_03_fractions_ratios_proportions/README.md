@@ -1,4 +1,3 @@
-````markdown
 # Fractions, Ratios and Proportions
 
 ## Overview
