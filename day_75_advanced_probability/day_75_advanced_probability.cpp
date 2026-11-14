@@ -1,619 +1,679 @@
-"use strict";
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <queue>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 /*
- * Advanced Probability
+ * Advanced Probability: Stochastic Modeling Engine
  *
- * Event-driven stochastic process engine.
- *
- * Concepts:
+ * C++17 implementation of:
  * - Finite-state Markov chains
- * - Stationary distributions
- * - Ergodicity and periodicity
- * - Martingale differences
- * - Conditional expectations
- * - Online statistical estimation
- * - Asynchronous simulation
+ * - Transition probability validation
+ * - Stationary distribution computation
+ * - Irreducibility and periodicity
+ * - Ergodicity classification
+ * - Martingale difference processes
+ * - Long-run empirical estimation
  *
- * Runtime: Node.js 18+
- * Dependencies: Node.js standard library only.
+ * No external libraries.
  */
 
-const { EventEmitter } = require("node:events");
-const { randomUUID } = require("node:crypto");
+using namespace std;
 
 // ============================================================
-// 1. ERRORS AND NUMERICAL UTILITIES
+// 1. DOMAIN TYPES
 // ============================================================
 
-class ProbabilityError extends Error {
-    constructor(message) {
-        super(message);
-        this.name = "ProbabilityError";
+enum class Classification {
+    Ergodic,
+    IrreduciblePeriodic,
+    Reducible
+};
+
+string classificationName(Classification value) {
+    switch (value) {
+        case Classification::Ergodic:
+            return "Ergodic";
+        case Classification::IrreduciblePeriodic:
+            return "Irreducible but periodic";
+        case Classification::Reducible:
+            return "Reducible";
+    }
+
+    return "Unknown";
+}
+
+struct StationaryResult {
+    vector<double> distribution;
+    int iterations;
+    bool converged;
+    double residual;
+};
+
+struct SimulationResult {
+    vector<int> path;
+    vector<double> empirical;
+    vector<vector<int>> transitionCounts;
+};
+
+// ============================================================
+// 2. VALIDATION
+// ============================================================
+
+class ProbabilityException : public runtime_error {
+public:
+    explicit ProbabilityException(const string& message)
+        : runtime_error(message) {}
+};
+
+void validateProbability(double probability) {
+    if (!isfinite(probability) ||
+        probability < 0.0 ||
+        probability > 1.0) {
+        throw ProbabilityException("Invalid probability.");
     }
 }
 
-function assertFinite(value, name) {
-    if (!Number.isFinite(value)) {
-        throw new ProbabilityError(`${name} must be finite.`);
-    }
-}
-
-function normalize(weights) {
-    if (!Array.isArray(weights) || weights.length === 0) {
-        throw new ProbabilityError("Weights cannot be empty.");
+double maximumDifference(
+    const vector<double>& a,
+    const vector<double>& b
+) {
+    if (a.size() != b.size()) {
+        throw ProbabilityException("Vector dimension mismatch.");
     }
 
-    weights.forEach((weight, index) => {
-        assertFinite(weight, `Weight ${index}`);
+    double result = 0.0;
 
-        if (weight < 0) {
-            throw new ProbabilityError("Negative weight.");
-        }
-    });
-
-    const total = weights.reduce((a, b) => a + b, 0);
-
-    if (total <= 0) {
-        throw new ProbabilityError("Total weight must be positive.");
+    for (size_t i = 0; i < a.size(); ++i) {
+        result = max(result, abs(a[i] - b[i]));
     }
 
-    return weights.map(weight => weight / total);
-}
-
-function dot(a, b) {
-    if (a.length !== b.length) {
-        throw new ProbabilityError("Vector dimensions differ.");
-    }
-
-    return a.reduce((sum, value, index) =>
-        sum + value * b[index], 0);
-}
-
-function maxDifference(a, b) {
-    return Math.max(
-        ...a.map((value, index) => Math.abs(value - b[index]))
-    );
+    return result;
 }
 
 // ============================================================
-// 2. REPRODUCIBLE RANDOM NUMBER GENERATOR
+// 3. MARKOV CHAIN ENGINE
 // ============================================================
 
-class RandomGenerator {
-    constructor(seed = 2026) {
-        this.state = seed >>> 0;
-    }
+class MarkovChain {
+private:
+    vector<vector<double>> transition;
+    vector<string> labels;
+    size_t n;
 
-    next() {
-        // Mulberry32 deterministic pseudorandom generator.
-        let value = this.state += 0x6D2B79F5;
+public:
+    MarkovChain(
+        vector<vector<double>> matrix,
+        vector<string> stateLabels
+    )
+        : transition(move(matrix)),
+          labels(move(stateLabels)),
+          n(transition.size()) {
 
-        value = Math.imul(value ^ value >>> 15, value | 1);
-        value ^= value + Math.imul(value ^ value >>> 7, value | 61);
-
-        return ((value ^ value >>> 14) >>> 0) / 4294967296;
-    }
-
-    categorical(probabilities) {
-        const value = this.next();
-        let cumulative = 0;
-
-        for (let index = 0; index < probabilities.length; index++) {
-            cumulative += probabilities[index];
-
-            if (value < cumulative) {
-                return index;
-            }
-        }
-
-        return probabilities.length - 1;
-    }
-}
-
-// ============================================================
-// 3. MARKOV CHAIN DOMAIN MODEL
-// ============================================================
-
-class MarkovModel {
-    constructor(states, transitionMatrix) {
-        if (!Array.isArray(states) || states.length === 0) {
-            throw new ProbabilityError("States cannot be empty.");
+        if (n == 0 || labels.size() != n) {
+            throw ProbabilityException("Invalid state configuration.");
         }
 
-        if (new Set(states).size !== states.length) {
-            throw new ProbabilityError("State names must be unique.");
-        }
-
-        if (transitionMatrix.length !== states.length) {
-            throw new ProbabilityError("Matrix dimensions differ.");
-        }
-
-        this.states = Object.freeze([...states]);
-
-        this.index = new Map(
-            states.map((state, position) => [state, position])
-        );
-
-        this.matrix = transitionMatrix.map((row, i) => {
-            if (!Array.isArray(row) || row.length !== states.length) {
-                throw new ProbabilityError(`Invalid matrix row ${i}.`);
+        for (const auto& row : transition) {
+            if (row.size() != n) {
+                throw ProbabilityException("Matrix must be square.");
             }
 
-            row.forEach((value, j) => {
-                assertFinite(value, `P(${i},${j})`);
+            double sum = 0.0;
 
-                if (value < 0 || value > 1) {
-                    throw new ProbabilityError("Invalid transition.");
-                }
-            });
+            for (double probability : row) {
+                validateProbability(probability);
+                sum += probability;
+            }
 
-            const total = row.reduce((a, b) => a + b, 0);
-
-            if (Math.abs(total - 1) > 1e-10) {
-                throw new ProbabilityError(
-                    `Transition row ${i} does not sum to one.`
+            if (abs(sum - 1.0) > 1e-10) {
+                throw ProbabilityException(
+                    "Transition row must sum to one."
                 );
             }
-
-            return Object.freeze([...row]);
-        });
-
-        Object.freeze(this.matrix);
-    }
-
-    get size() {
-        return this.states.length;
-    }
-
-    getIndex(state) {
-        if (!this.index.has(state)) {
-            throw new ProbabilityError(`Unknown state: ${state}`);
         }
 
-        return this.index.get(state);
+        sort(labels.begin(), labels.end());
+
+        if (adjacent_find(labels.begin(), labels.end()) != labels.end()) {
+            throw ProbabilityException("Duplicate state labels.");
+        }
     }
 
-    transition(stateIndex, rng) {
-        if (!Number.isInteger(stateIndex) ||
-            stateIndex < 0 ||
-            stateIndex >= this.size) {
-            throw new ProbabilityError("Invalid state index.");
-        }
-
-        return rng.categorical(this.matrix[stateIndex]);
+    size_t size() const {
+        return n;
     }
 
-    multiply(distribution) {
-        if (distribution.length !== this.size) {
-            throw new ProbabilityError("Distribution dimension mismatch.");
+    const vector<string>& getLabels() const {
+        return labels;
+    }
+
+    const vector<vector<double>>& matrix() const {
+        return transition;
+    }
+
+    int sampleNext(int current, mt19937_64& generator) const {
+        if (current < 0 || static_cast<size_t>(current) >= n) {
+            throw ProbabilityException("Invalid state index.");
         }
 
-        return Array.from({ length: this.size }, (_, destination) =>
-            distribution.reduce(
-                (sum, probability, source) =>
-                    sum + probability * this.matrix[source][destination],
-                0
-            )
+        discrete_distribution<int> distribution(
+            transition[current].begin(),
+            transition[current].end()
         );
+
+        return distribution(generator);
     }
 
-    stationary(tolerance = 1e-12, maxIterations = 100000) {
-        if (tolerance <= 0 || maxIterations <= 0) {
-            throw new ProbabilityError("Invalid iteration parameters.");
+    vector<double> multiply(
+        const vector<double>& distribution
+    ) const {
+        if (distribution.size() != n) {
+            throw ProbabilityException("Distribution size mismatch.");
         }
 
-        let current = Array(this.size).fill(1 / this.size);
+        vector<double> result(n, 0.0);
 
-        for (let iteration = 1; iteration <= maxIterations; iteration++) {
-            const next = this.multiply(current);
-            const error = maxDifference(current, next);
+        for (size_t i = 0; i < n; ++i) {
+            if (!isfinite(distribution[i]) || distribution[i] < 0) {
+                throw ProbabilityException("Invalid distribution.");
+            }
 
-            current = next;
-
-            if (error < tolerance) {
-                return {
-                    distribution: current,
-                    iterations: iteration,
-                    converged: true,
-                    residual: error
-                };
+            for (size_t j = 0; j < n; ++j) {
+                result[j] += distribution[i] * transition[i][j];
             }
         }
-
-        const residual = maxDifference(current, this.multiply(current));
-
-        return {
-            distribution: current,
-            iterations: maxIterations,
-            converged: false,
-            residual
-        };
-    }
-
-    reachable(start) {
-        const visited = new Set([start]);
-        const queue = [start];
-
-        for (let position = 0; position < queue.length; position++) {
-            const current = queue[position];
-
-            this.matrix[current].forEach((probability, destination) => {
-                if (probability > 0 && !visited.has(destination)) {
-                    visited.add(destination);
-                    queue.push(destination);
-                }
-            });
-        }
-
-        return visited;
-    }
-
-    isIrreducible() {
-        return this.states.every((_, state) =>
-            this.reachable(state).size === this.size
-        );
-    }
-
-    period(start = 0) {
-        const distances = new Array(this.size).fill(-1);
-        const queue = [start];
-
-        distances[start] = 0;
-
-        for (let position = 0; position < queue.length; position++) {
-            const current = queue[position];
-
-            this.matrix[current].forEach((probability, destination) => {
-                if (probability > 0 && distances[destination] === -1) {
-                    distances[destination] = distances[current] + 1;
-                    queue.push(destination);
-                }
-            });
-        }
-
-        if (distances.some(distance => distance < 0)) {
-            throw new ProbabilityError(
-                "Period requires an irreducible chain."
-            );
-        }
-
-        const gcd = (a, b) => b === 0 ? a : gcd(b, a % b);
-
-        let result = 0;
-
-        this.matrix.forEach((row, source) => {
-            row.forEach((probability, destination) => {
-                if (probability > 0) {
-                    const difference = Math.abs(
-                        distances[source] + 1 - distances[destination]
-                    );
-
-                    result = gcd(result, difference);
-                }
-            });
-        });
 
         return result;
     }
 
-    classify() {
-        if (!this.isIrreducible()) {
-            return "reducible";
+    // --------------------------------------------------------
+    // 4. GRAPH ANALYSIS
+    // --------------------------------------------------------
+
+    vector<int> distancesFrom(int start) const {
+        if (start < 0 || static_cast<size_t>(start) >= n) {
+            throw ProbabilityException("Invalid starting state.");
         }
 
-        return this.period() === 1
-            ? "ergodic"
-            : "irreducible_periodic";
-    }
-}
+        vector<int> distance(n, -1);
+        queue<int> pending;
 
-// ============================================================
-// 4. MARTINGALE REWARD PROCESS
-// ============================================================
+        distance[start] = 0;
+        pending.push(start);
 
-class MartingaleProcess {
-    constructor(model, rewardFunction) {
-        this.model = model;
-        this.rewardFunction = rewardFunction;
+        while (!pending.empty()) {
+            int current = pending.front();
+            pending.pop();
 
-        this.conditionalMeans = model.matrix.map((row, state) =>
-            row.reduce(
-                (sum, probability, destination) =>
-                    sum + probability *
-                    rewardFunction(state, destination),
-                0
-            )
-        );
-    }
+            for (size_t destination = 0; destination < n; ++destination) {
+                if (transition[current][destination] > 0 &&
+                    distance[destination] == -1) {
 
-    increment(source, destination) {
-        return this.rewardFunction(source, destination)
-            - this.conditionalMeans[source];
-    }
-
-    verifyConditionalExpectations(tolerance = 1e-10) {
-        return this.model.matrix.every((row, source) => {
-            const expected = row.reduce(
-                (sum, probability, destination) =>
-                    sum + probability *
-                    this.increment(source, destination),
-                0
-            );
-
-            return Math.abs(expected) < tolerance;
-        });
-    }
-
-    buildPath(path) {
-        if (!Array.isArray(path) || path.length < 2) {
-            throw new ProbabilityError("Path is too short.");
-        }
-
-        let cumulative = 0;
-        const values = [0];
-
-        for (let i = 0; i < path.length - 1; i++) {
-            const source = path[i];
-            const destination = path[i + 1];
-
-            if (!Number.isInteger(source) ||
-                !Number.isInteger(destination) ||
-                source < 0 || destination < 0 ||
-                source >= this.model.size ||
-                destination >= this.model.size ||
-                this.model.matrix[source][destination] <= 0) {
-                throw new ProbabilityError("Invalid observed transition.");
-            }
-
-            cumulative += this.increment(source, destination);
-            values.push(cumulative);
-        }
-
-        return values;
-    }
-}
-
-// ============================================================
-// 5. ONLINE STATISTICS
-// ============================================================
-
-class OnlineStatistics {
-    constructor(size) {
-        this.visits = new Array(size).fill(0);
-        this.transitions = new Map();
-        this.total = 0;
-    }
-
-    record(source, destination) {
-        this.visits[destination]++;
-        this.total++;
-
-        const key = `${source}:${destination}`;
-
-        this.transitions.set(
-            key,
-            (this.transitions.get(key) || 0) + 1
-        );
-    }
-
-    distribution() {
-        if (this.total === 0) {
-            return this.visits.map(() => 0);
-        }
-
-        return this.visits.map(value => value / this.total);
-    }
-}
-
-// ============================================================
-// 6. EVENT-DRIVEN ASYNCHRONOUS SIMULATOR
-// ============================================================
-
-class StochasticSimulator extends EventEmitter {
-    constructor(model, seed = 2026) {
-        super();
-
-        this.model = model;
-        this.rng = new RandomGenerator(seed);
-        this.statistics = new OnlineStatistics(model.size);
-        this.id = randomUUID();
-        this.running = false;
-        this.stepNumber = 0;
-    }
-
-    async run(initialState, steps, batchSize = 1000) {
-        if (this.running) {
-            throw new ProbabilityError("Simulation is already running.");
-        }
-
-        if (!Number.isInteger(initialState) ||
-            initialState < 0 ||
-            initialState >= this.model.size) {
-            throw new ProbabilityError("Invalid initial state.");
-        }
-
-        if (!Number.isInteger(steps) || steps < 0 ||
-            !Number.isInteger(batchSize) || batchSize <= 0) {
-            throw new ProbabilityError("Invalid simulation parameters.");
-        }
-
-        this.running = true;
-
-        let current = initialState;
-
-        try {
-            this.emit("started", {
-                id: this.id,
-                initialState,
-                steps
-            });
-
-            for (let i = 0; i < steps; i++) {
-                const following = this.model.transition(current, this.rng);
-
-                this.statistics.record(current, following);
-
-                current = following;
-                this.stepNumber++;
-
-                this.emit("transition", {
-                    step: this.stepNumber,
-                    state: current,
-                    label: this.model.states[current]
-                });
-
-                // Yield control periodically to avoid blocking Node.js.
-                if ((i + 1) % batchSize === 0) {
-                    await new Promise(resolve => setImmediate(resolve));
-
-                    this.emit("progress", {
-                        completed: i + 1,
-                        total: steps
-                    });
+                    distance[destination] = distance[current] + 1;
+                    pending.push(static_cast<int>(destination));
                 }
             }
-
-            const result = {
-                id: this.id,
-                steps: this.stepNumber,
-                finalState: current,
-                empiricalDistribution: this.statistics.distribution(),
-                transitions: Object.fromEntries(this.statistics.transitions)
-            };
-
-            this.emit("completed", result);
-
-            return result;
-        } catch (error) {
-            this.emit("failed", error);
-            throw error;
-        } finally {
-            this.running = false;
         }
-    }
-}
 
-// ============================================================
-// 7. EXPERIMENT
-// ============================================================
-
-async function main() {
-    const model = new MarkovModel(
-        ["Sunny", "Cloudy", "Rainy"],
-        [
-            [0.70, 0.20, 0.10],
-            [0.25, 0.50, 0.25],
-            [0.20, 0.30, 0.50]
-        ]
-    );
-
-    console.log("ADVANCED PROBABILITY");
-    console.log("====================");
-
-    console.log("\nStationary distribution:");
-
-    const stationary = model.stationary();
-
-    if (!stationary.converged) {
-        throw new Error("Stationary iteration failed.");
+        return distance;
     }
 
-    console.table(
-        model.states.map((state, index) => ({
-            state,
-            probability: stationary.distribution[index]
-        }))
-    );
+    bool isIrreducible() const {
+        for (size_t state = 0; state < n; ++state) {
+            auto distance = distancesFrom(static_cast<int>(state));
 
-    console.log("Iterations:", stationary.iterations);
-    console.log("Classification:", model.classify());
-    console.log("Period:", model.period());
+            if (find(distance.begin(), distance.end(), -1)
+                != distance.end()) {
+                return false;
+            }
+        }
 
-    // Conditional reward and martingale difference.
-    const reward = (source, destination) => destination - source;
+        return true;
+    }
 
-    const martingale = new MartingaleProcess(model, reward);
+    int period(int start = 0) const {
+        auto distance = distancesFrom(start);
 
-    console.log(
-        "\nConditional expectations valid:",
-        martingale.verifyConditionalExpectations()
-    );
+        if (find(distance.begin(), distance.end(), -1)
+            != distance.end()) {
+            throw ProbabilityException(
+                "Period requires an irreducible chain."
+            );
+        }
 
-    // Subscribe to selected simulation events.
-    const simulator = new StochasticSimulator(model, 2026);
+        int result = 0;
 
-    simulator.on("started", event => {
-        console.log("\nSimulation started:", event.id);
-    });
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = 0; j < n; ++j) {
+                if (transition[i][j] > 0) {
+                    int difference = abs(
+                        distance[i] + 1 - distance[j]
+                    );
 
-    simulator.on("progress", event => {
-        console.log(
-            `Progress: ${event.completed}/${event.total}`
+                    result = gcd(result, difference);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    Classification classify() const {
+        if (!isIrreducible()) {
+            return Classification::Reducible;
+        }
+
+        return period() == 1
+            ? Classification::Ergodic
+            : Classification::IrreduciblePeriodic;
+    }
+
+    // --------------------------------------------------------
+    // 5. STATIONARY DISTRIBUTION
+    // --------------------------------------------------------
+
+    StationaryResult stationary(
+        double tolerance = 1e-12,
+        int maxIterations = 100000
+    ) const {
+        if (!isfinite(tolerance) || tolerance <= 0 ||
+            maxIterations <= 0) {
+            throw ProbabilityException("Invalid iteration settings.");
+        }
+
+        vector<double> current(n, 1.0 / n);
+
+        for (int iteration = 1; iteration <= maxIterations; ++iteration) {
+            vector<double> next = multiply(current);
+
+            double residual = maximumDifference(current, next);
+
+            current = move(next);
+
+            if (residual < tolerance) {
+                return {
+                    current,
+                    iteration,
+                    true,
+                    residual
+                };
+            }
+        }
+
+        return {
+            current,
+            maxIterations,
+            false,
+            maximumDifference(current, multiply(current))
+        };
+    }
+
+    // --------------------------------------------------------
+    // 6. MONTE CARLO SIMULATION
+    // --------------------------------------------------------
+
+    SimulationResult simulate(
+        int initialState,
+        int steps,
+        uint64_t seed
+    ) const {
+        if (initialState < 0 ||
+            static_cast<size_t>(initialState) >= n ||
+            steps < 0) {
+            throw ProbabilityException("Invalid simulation settings.");
+        }
+
+        mt19937_64 generator(seed);
+
+        SimulationResult result;
+        result.path.reserve(static_cast<size_t>(steps) + 1);
+
+        result.transitionCounts.assign(
+            n, vector<int>(n, 0)
         );
-    });
 
-    simulator.on("failed", error => {
-        console.error("Simulation failed:", error.message);
-    });
+        vector<int> visits(n, 0);
 
-    const result = await simulator.run(0, 100000, 10000);
+        int current = initialState;
+        result.path.push_back(current);
+        visits[current]++;
 
-    console.log("\nEmpirical distribution:");
+        for (int step = 0; step < steps; ++step) {
+            int following = sampleNext(current, generator);
 
-    console.table(
-        model.states.map((state, index) => ({
-            state,
-            probability: result.empiricalDistribution[index]
-        }))
-    );
+            result.transitionCounts[current][following]++;
+            result.path.push_back(following);
 
-    console.log(
-        "Maximum distribution error:",
-        maxDifference(
-            stationary.distribution,
-            result.empiricalDistribution
-        )
-    );
+            visits[following]++;
+            current = following;
+        }
 
-    // Verify martingale behavior on an observed path.
-    const path = [0, 1, 2, 1, 0, 0, 2, 1];
+        result.empirical.resize(n);
 
-    const martingaleValues = martingale.buildPath(path);
+        const double total = static_cast<double>(steps + 1);
 
-    console.log("\nMartingale path:", martingaleValues);
+        for (size_t i = 0; i < n; ++i) {
+            result.empirical[i] = visits[i] / total;
+        }
 
-    // Periodic chain.
-    const periodic = new MarkovModel(
-        ["A", "B"],
-        [
-            [0, 1],
-            [1, 0]
-        ]
-    );
+        return result;
+    }
+};
 
-    console.log("\nPeriodic chain:");
-    console.log("Period:", periodic.period());
-    console.log("Classification:", periodic.classify());
-    console.log(
-        "Power iteration:",
-        periodic.stationary(1e-12, 100).converged
-    );
+// ============================================================
+// 7. MARTINGALE DIFFERENCE PROCESS
+// ============================================================
 
-    // Reducible chain.
-    const reducible = new MarkovModel(
-        ["A", "B"],
-        [
-            [0.8, 0.2],
-            [0, 1]
-        ]
-    );
+class MartingaleAnalyzer {
+private:
+    const MarkovChain& chain;
+    vector<double> conditionalMeans;
 
-    console.log("\nReducible chain:", reducible.classify());
+public:
+    using Reward = function<double(int, int)>;
 
-    console.log("\nExperiment completed.");
+    MartingaleAnalyzer(
+        const MarkovChain& model,
+        Reward reward
+    )
+        : chain(model) {
+
+        const auto& matrix = chain.matrix();
+
+        conditionalMeans.resize(chain.size(), 0.0);
+
+        for (size_t source = 0; source < chain.size(); ++source) {
+            for (size_t destination = 0;
+                 destination < chain.size();
+                 ++destination) {
+
+                double value = reward(
+                    static_cast<int>(source),
+                    static_cast<int>(destination)
+                );
+
+                if (!isfinite(value)) {
+                    throw ProbabilityException("Invalid reward.");
+                }
+
+                conditionalMeans[source] +=
+                    matrix[source][destination] * value;
+            }
+        }
+
+        this->reward = move(reward);
+    }
+
+    vector<double> analyze(const vector<int>& path) const {
+        if (path.size() < 2) {
+            throw ProbabilityException("Insufficient observations.");
+        }
+
+        vector<double> martingale{0.0};
+
+        for (size_t i = 0; i + 1 < path.size(); ++i) {
+            int source = path[i];
+            int destination = path[i + 1];
+
+            if (source < 0 || destination < 0 ||
+                static_cast<size_t>(source) >= chain.size() ||
+                static_cast<size_t>(destination) >= chain.size() ||
+                chain.matrix()[source][destination] <= 0) {
+
+                throw ProbabilityException("Invalid observed transition.");
+            }
+
+            double increment =
+                reward(source, destination) -
+                conditionalMeans[source];
+
+            martingale.push_back(
+                martingale.back() + increment
+            );
+        }
+
+        return martingale;
+    }
+
+    bool verify(double tolerance = 1e-10) const {
+        const auto& matrix = chain.matrix();
+
+        for (size_t source = 0; source < chain.size(); ++source) {
+            double conditionalExpectation = 0.0;
+
+            for (size_t destination = 0;
+                 destination < chain.size();
+                 ++destination) {
+
+                double residual =
+                    reward(
+                        static_cast<int>(source),
+                        static_cast<int>(destination)
+                    ) - conditionalMeans[source];
+
+                conditionalExpectation +=
+                    matrix[source][destination] * residual;
+            }
+
+            if (abs(conditionalExpectation) > tolerance) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+private:
+    Reward reward;
+};
+
+// ============================================================
+// 8. LONG-RUN REWARD
+// ============================================================
+
+double expectedLongRunReward(
+    const vector<double>& stationary,
+    const vector<double>& rewards
+) {
+    if (stationary.size() != rewards.size()) {
+        throw ProbabilityException("Reward dimension mismatch.");
+    }
+
+    double result = 0.0;
+
+    for (size_t i = 0; i < rewards.size(); ++i) {
+        result += stationary[i] * rewards[i];
+    }
+
+    return result;
 }
 
-main().catch(error => {
-    console.error("Fatal error:", error.message);
-    process.exitCode = 1;
-});
+// ============================================================
+// 9. PRESENTATION AND EXECUTION
+// ============================================================
+
+void printDistribution(
+    const vector<string>& labels,
+    const vector<double>& distribution
+) {
+    cout << fixed << setprecision(6);
+
+    for (size_t i = 0; i < labels.size(); ++i) {
+        cout << setw(12) << left << labels[i]
+             << distribution[i] << '\n';
+    }
+}
+
+int main() {
+    try {
+        cout << "ADVANCED PROBABILITY ENGINE\n";
+        cout << "===========================\n";
+
+        MarkovChain weather(
+            {
+                {0.70, 0.20, 0.10},
+                {0.25, 0.50, 0.25},
+                {0.20, 0.30, 0.50}
+            },
+            {"Sunny", "Cloudy", "Rainy"}
+        );
+
+        cout << "\n1. STATIONARY DISTRIBUTION\n";
+
+        StationaryResult stationary = weather.stationary();
+
+        if (!stationary.converged) {
+            throw runtime_error(
+                "Stationary iteration did not converge."
+            );
+        }
+
+        printDistribution(
+            weather.getLabels(),
+            stationary.distribution
+        );
+
+        cout << "Iterations: " << stationary.iterations << '\n';
+        cout << "Residual: " << stationary.residual << '\n';
+
+        cout << "\n2. CHAIN CLASSIFICATION\n";
+
+        cout << "Irreducible: "
+             << boolalpha << weather.isIrreducible() << '\n';
+
+        cout << "Period: " << weather.period() << '\n';
+
+        cout << "Classification: "
+             << classificationName(weather.classify()) << '\n';
+
+        cout << "\n3. MONTE CARLO SIMULATION\n";
+
+        SimulationResult simulation = weather.simulate(
+            0, 100000, 2026
+        );
+
+        printDistribution(
+            weather.getLabels(),
+            simulation.empirical
+        );
+
+        cout << "\n4. DISTRIBUTION ERROR\n";
+
+        double maximumError = maximumDifference(
+            stationary.distribution,
+            simulation.empirical
+        );
+
+        cout << "Maximum absolute error: "
+             << maximumError << '\n';
+
+        cout << "\n5. LONG-RUN REWARD\n";
+
+        vector<double> rewards = {100.0, 60.0, 20.0};
+
+        cout << "Expected reward: "
+             << expectedLongRunReward(
+                 stationary.distribution,
+                 rewards
+             ) << '\n';
+
+        cout << "\n6. MARTINGALE ANALYSIS\n";
+
+        auto rewardFunction = [](int source, int destination) {
+            return static_cast<double>(destination - source);
+        };
+
+        MartingaleAnalyzer analyzer(
+            weather,
+            rewardFunction
+        );
+
+        cout << "Conditional identities verified: "
+             << analyzer.verify() << '\n';
+
+        vector<int> shortPath(
+            simulation.path.begin(),
+            simulation.path.begin() + 101
+        );
+
+        vector<double> martingale =
+            analyzer.analyze(shortPath);
+
+        cout << "First 10 martingale values:\n";
+
+        for (size_t i = 0;
+             i < min<size_t>(10, martingale.size());
+             ++i) {
+            cout << martingale[i] << ' ';
+        }
+
+        cout << '\n';
+
+        cout << "\n7. PERIODIC CHAIN\n";
+
+        MarkovChain periodic(
+            {
+                {0.0, 1.0},
+                {1.0, 0.0}
+            },
+            {"A", "B"}
+        );
+
+        cout << "Period: " << periodic.period() << '\n';
+
+        cout << "Classification: "
+             << classificationName(periodic.classify()) << '\n';
+
+        StationaryResult periodicResult =
+            periodic.stationary(1e-12, 100);
+
+        cout << "Power iteration converged: "
+             << periodicResult.converged << '\n';
+
+        cout << "\n8. REDUCIBLE CHAIN\n";
+
+        MarkovChain reducible(
+            {
+                {0.8, 0.2},
+                {0.0, 1.0}
+            },
+            {"Transient", "Absorbing"}
+        );
+
+        cout << "Classification: "
+             << classificationName(reducible.classify()) << '\n';
+
+        cout << "\n9. INPUT VALIDATION\n";
+
+        try {
+            MarkovChain invalid(
+                {
+                    {0.4, 0.4},
+                    {0.2, 0.9}
+                },
+                {"A", "B"}
+            );
+        } catch (const ProbabilityException& error) {
+            cout << "Invalid matrix rejected: "
+                 << error.what() << '\n';
+        }
+
+        cout << "\nExecution completed successfully.\n";
+
+    } catch (const exception& error) {
+        cerr << "Execution failed: " << error.what() << '\n';
+        return 1;
+    }
+
+    return 0;
+}
