@@ -1,619 +1,908 @@
-"use strict";
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.SplittableRandom;
+import java.util.stream.Collectors;
 
 /*
- * Advanced Probability
+ * Advanced Probability: Enterprise Stochastic Modeling
  *
- * Event-driven stochastic process engine.
+ * Java 17 implementation.
  *
- * Concepts:
+ * Features:
+ * - Immutable stochastic models
  * - Finite-state Markov chains
  * - Stationary distributions
- * - Ergodicity and periodicity
- * - Martingale differences
- * - Conditional expectations
- * - Online statistical estimation
- * - Asynchronous simulation
- *
- * Runtime: Node.js 18+
- * Dependencies: Node.js standard library only.
+ * - Irreducibility and periodicity
+ * - Ergodicity classification
+ * - Martingale difference analysis
+ * - Simulation services
+ * - Statistical reporting
+ * - Domain validation and exceptions
  */
 
-const { EventEmitter } = require("node:events");
-const { randomUUID } = require("node:crypto");
+public class AdvancedProbability {
 
-// ============================================================
-// 1. ERRORS AND NUMERICAL UTILITIES
-// ============================================================
+    // ========================================================
+    // 1. DOMAIN EXCEPTIONS
+    // ========================================================
 
-class ProbabilityError extends Error {
-    constructor(message) {
-        super(message);
-        this.name = "ProbabilityError";
-    }
-}
-
-function assertFinite(value, name) {
-    if (!Number.isFinite(value)) {
-        throw new ProbabilityError(`${name} must be finite.`);
-    }
-}
-
-function normalize(weights) {
-    if (!Array.isArray(weights) || weights.length === 0) {
-        throw new ProbabilityError("Weights cannot be empty.");
-    }
-
-    weights.forEach((weight, index) => {
-        assertFinite(weight, `Weight ${index}`);
-
-        if (weight < 0) {
-            throw new ProbabilityError("Negative weight.");
+    static class ProbabilityException extends RuntimeException {
+        ProbabilityException(String message) {
+            super(message);
         }
-    });
-
-    const total = weights.reduce((a, b) => a + b, 0);
-
-    if (total <= 0) {
-        throw new ProbabilityError("Total weight must be positive.");
     }
 
-    return weights.map(weight => weight / total);
-}
+    // ========================================================
+    // 2. ENUMERATIONS
+    // ========================================================
 
-function dot(a, b) {
-    if (a.length !== b.length) {
-        throw new ProbabilityError("Vector dimensions differ.");
+    enum ChainType {
+        ERGODIC,
+        IRREDUCIBLE_PERIODIC,
+        REDUCIBLE
     }
 
-    return a.reduce((sum, value, index) =>
-        sum + value * b[index], 0);
-}
-
-function maxDifference(a, b) {
-    return Math.max(
-        ...a.map((value, index) => Math.abs(value - b[index]))
-    );
-}
-
-// ============================================================
-// 2. REPRODUCIBLE RANDOM NUMBER GENERATOR
-// ============================================================
-
-class RandomGenerator {
-    constructor(seed = 2026) {
-        this.state = seed >>> 0;
+    enum SimulationStatus {
+        CREATED,
+        RUNNING,
+        COMPLETED,
+        FAILED
     }
 
-    next() {
-        // Mulberry32 deterministic pseudorandom generator.
-        let value = this.state += 0x6D2B79F5;
+    // ========================================================
+    // 3. IMMUTABLE RESULT TYPES
+    // ========================================================
 
-        value = Math.imul(value ^ value >>> 15, value | 1);
-        value ^= value + Math.imul(value ^ value >>> 7, value | 61);
-
-        return ((value ^ value >>> 14) >>> 0) / 4294967296;
-    }
-
-    categorical(probabilities) {
-        const value = this.next();
-        let cumulative = 0;
-
-        for (let index = 0; index < probabilities.length; index++) {
-            cumulative += probabilities[index];
-
-            if (value < cumulative) {
-                return index;
-            }
+    record StationaryResult(
+        List<Double> probabilities,
+        int iterations,
+        boolean converged,
+        double residual
+    ) {
+        StationaryResult {
+            probabilities = List.copyOf(probabilities);
         }
-
-        return probabilities.length - 1;
     }
-}
 
-// ============================================================
-// 3. MARKOV CHAIN DOMAIN MODEL
-// ============================================================
-
-class MarkovModel {
-    constructor(states, transitionMatrix) {
-        if (!Array.isArray(states) || states.length === 0) {
-            throw new ProbabilityError("States cannot be empty.");
+    record SimulationReport(
+        String simulationId,
+        SimulationStatus status,
+        long transitions,
+        List<String> path,
+        Map<String, Double> empiricalDistribution,
+        double maximumError
+    ) {
+        SimulationReport {
+            path = List.copyOf(path);
+            empiricalDistribution = Map.copyOf(
+                empiricalDistribution
+            );
         }
+    }
 
-        if (new Set(states).size !== states.length) {
-            throw new ProbabilityError("State names must be unique.");
-        }
+    record Transition(
+        String source,
+        String destination,
+        double probability
+    ) {
+        Transition {
+            Objects.requireNonNull(source);
+            Objects.requireNonNull(destination);
 
-        if (transitionMatrix.length !== states.length) {
-            throw new ProbabilityError("Matrix dimensions differ.");
-        }
-
-        this.states = Object.freeze([...states]);
-
-        this.index = new Map(
-            states.map((state, position) => [state, position])
-        );
-
-        this.matrix = transitionMatrix.map((row, i) => {
-            if (!Array.isArray(row) || row.length !== states.length) {
-                throw new ProbabilityError(`Invalid matrix row ${i}.`);
-            }
-
-            row.forEach((value, j) => {
-                assertFinite(value, `P(${i},${j})`);
-
-                if (value < 0 || value > 1) {
-                    throw new ProbabilityError("Invalid transition.");
-                }
-            });
-
-            const total = row.reduce((a, b) => a + b, 0);
-
-            if (Math.abs(total - 1) > 1e-10) {
-                throw new ProbabilityError(
-                    `Transition row ${i} does not sum to one.`
+            if (source.isBlank() || destination.isBlank()) {
+                throw new ProbabilityException(
+                    "Transition states cannot be blank."
                 );
             }
 
-            return Object.freeze([...row]);
-        });
-
-        Object.freeze(this.matrix);
+            if (!Double.isFinite(probability) ||
+                probability < 0 || probability > 1) {
+                throw new ProbabilityException(
+                    "Invalid transition probability."
+                );
+            }
+        }
     }
 
-    get size() {
-        return this.states.length;
-    }
+    // ========================================================
+    // 4. STOCHASTIC MODEL
+    // ========================================================
 
-    getIndex(state) {
-        if (!this.index.has(state)) {
-            throw new ProbabilityError(`Unknown state: ${state}`);
+    static final class MarkovModel {
+
+        private final List<String> states;
+        private final Map<String, Integer> stateIndex;
+        private final double[][] matrix;
+        private final int size;
+
+        MarkovModel(
+            List<String> states,
+            List<Transition> transitions
+        ) {
+            Objects.requireNonNull(states);
+            Objects.requireNonNull(transitions);
+
+            if (states.isEmpty()) {
+                throw new ProbabilityException(
+                    "At least one state is required."
+                );
+            }
+
+            this.states = List.copyOf(states);
+            this.size = states.size();
+
+            if (new HashSet<>(states).size() != size ||
+                states.stream().anyMatch(
+                    state -> state == null || state.isBlank()
+                )) {
+                throw new ProbabilityException(
+                    "State identifiers must be nonblank and unique."
+                );
+            }
+
+            Map<String, Integer> indexes = new HashMap<>();
+
+            for (int i = 0; i < size; i++) {
+                indexes.put(states.get(i), i);
+            }
+
+            this.stateIndex = Collections.unmodifiableMap(indexes);
+            this.matrix = new double[size][size];
+
+            Set<String> suppliedTransitions = new HashSet<>();
+
+            for (Transition transition : transitions) {
+                Integer source = indexes.get(transition.source());
+                Integer destination = indexes.get(
+                    transition.destination()
+                );
+
+                if (source == null || destination == null) {
+                    throw new ProbabilityException(
+                        "Transition references an unknown state."
+                    );
+                }
+
+                String key = source + ":" + destination;
+
+                if (!suppliedTransitions.add(key)) {
+                    throw new ProbabilityException(
+                        "Duplicate transition definition."
+                    );
+                }
+
+                matrix[source][destination] =
+                    transition.probability();
+            }
+
+            validateRows();
         }
 
-        return this.index.get(state);
-    }
+        private void validateRows() {
+            for (int i = 0; i < size; i++) {
+                double sum = Arrays.stream(matrix[i]).sum();
 
-    transition(stateIndex, rng) {
-        if (!Number.isInteger(stateIndex) ||
-            stateIndex < 0 ||
-            stateIndex >= this.size) {
-            throw new ProbabilityError("Invalid state index.");
-        }
-
-        return rng.categorical(this.matrix[stateIndex]);
-    }
-
-    multiply(distribution) {
-        if (distribution.length !== this.size) {
-            throw new ProbabilityError("Distribution dimension mismatch.");
-        }
-
-        return Array.from({ length: this.size }, (_, destination) =>
-            distribution.reduce(
-                (sum, probability, source) =>
-                    sum + probability * this.matrix[source][destination],
-                0
-            )
-        );
-    }
-
-    stationary(tolerance = 1e-12, maxIterations = 100000) {
-        if (tolerance <= 0 || maxIterations <= 0) {
-            throw new ProbabilityError("Invalid iteration parameters.");
-        }
-
-        let current = Array(this.size).fill(1 / this.size);
-
-        for (let iteration = 1; iteration <= maxIterations; iteration++) {
-            const next = this.multiply(current);
-            const error = maxDifference(current, next);
-
-            current = next;
-
-            if (error < tolerance) {
-                return {
-                    distribution: current,
-                    iterations: iteration,
-                    converged: true,
-                    residual: error
-                };
+                if (Math.abs(sum - 1.0) > 1e-10) {
+                    throw new ProbabilityException(
+                        "Transition row " + i +
+                        " must sum to one. Actual: " + sum
+                    );
+                }
             }
         }
 
-        const residual = maxDifference(current, this.multiply(current));
-
-        return {
-            distribution: current,
-            iterations: maxIterations,
-            converged: false,
-            residual
-        };
-    }
-
-    reachable(start) {
-        const visited = new Set([start]);
-        const queue = [start];
-
-        for (let position = 0; position < queue.length; position++) {
-            const current = queue[position];
-
-            this.matrix[current].forEach((probability, destination) => {
-                if (probability > 0 && !visited.has(destination)) {
-                    visited.add(destination);
-                    queue.push(destination);
-                }
-            });
+        int size() {
+            return size;
         }
 
-        return visited;
-    }
-
-    isIrreducible() {
-        return this.states.every((_, state) =>
-            this.reachable(state).size === this.size
-        );
-    }
-
-    period(start = 0) {
-        const distances = new Array(this.size).fill(-1);
-        const queue = [start];
-
-        distances[start] = 0;
-
-        for (let position = 0; position < queue.length; position++) {
-            const current = queue[position];
-
-            this.matrix[current].forEach((probability, destination) => {
-                if (probability > 0 && distances[destination] === -1) {
-                    distances[destination] = distances[current] + 1;
-                    queue.push(destination);
-                }
-            });
+        List<String> states() {
+            return states;
         }
 
-        if (distances.some(distance => distance < 0)) {
-            throw new ProbabilityError(
-                "Period requires an irreducible chain."
+        int indexOf(String state) {
+            Integer index = stateIndex.get(state);
+
+            if (index == null) {
+                throw new ProbabilityException(
+                    "Unknown state: " + state
+                );
+            }
+
+            return index;
+        }
+
+        double probability(int source, int destination) {
+            return matrix[source][destination];
+        }
+
+        double[] row(int state) {
+            return matrix[state].clone();
+        }
+
+        double[] multiply(double[] distribution) {
+            if (distribution.length != size) {
+                throw new ProbabilityException(
+                    "Distribution dimension mismatch."
+                );
+            }
+
+            double[] result = new double[size];
+
+            for (int i = 0; i < size; i++) {
+                if (!Double.isFinite(distribution[i]) ||
+                    distribution[i] < 0) {
+                    throw new ProbabilityException(
+                        "Invalid distribution entry."
+                    );
+                }
+
+                for (int j = 0; j < size; j++) {
+                    result[j] +=
+                        distribution[i] * matrix[i][j];
+                }
+            }
+
+            return result;
+        }
+
+        // ----------------------------------------------------
+        // 5. GRAPH ANALYSIS
+        // ----------------------------------------------------
+
+        private int[] distancesFrom(int start) {
+            if (start < 0 || start >= size) {
+                throw new ProbabilityException(
+                    "Invalid starting state."
+                );
+            }
+
+            int[] distance = new int[size];
+            Arrays.fill(distance, -1);
+
+            ArrayDeque<Integer> queue = new ArrayDeque<>();
+
+            distance[start] = 0;
+            queue.add(start);
+
+            while (!queue.isEmpty()) {
+                int current = queue.remove();
+
+                for (int destination = 0;
+                     destination < size;
+                     destination++) {
+
+                    if (matrix[current][destination] > 0 &&
+                        distance[destination] == -1) {
+
+                        distance[destination] =
+                            distance[current] + 1;
+
+                        queue.add(destination);
+                    }
+                }
+            }
+
+            return distance;
+        }
+
+        boolean isIrreducible() {
+            for (int state = 0; state < size; state++) {
+                int[] distances = distancesFrom(state);
+
+                for (int distance : distances) {
+                    if (distance < 0) {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        private int gcd(int a, int b) {
+            return b == 0 ? a : gcd(b, a % b);
+        }
+
+        int period(int start) {
+            int[] distances = distancesFrom(start);
+
+            for (int distance : distances) {
+                if (distance < 0) {
+                    throw new ProbabilityException(
+                        "Period requires an irreducible chain."
+                    );
+                }
+            }
+
+            int result = 0;
+
+            for (int i = 0; i < size; i++) {
+                for (int j = 0; j < size; j++) {
+                    if (matrix[i][j] > 0) {
+                        int difference = Math.abs(
+                            distances[i] + 1 - distances[j]
+                        );
+
+                        result = gcd(result, difference);
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        ChainType classify() {
+            if (!isIrreducible()) {
+                return ChainType.REDUCIBLE;
+            }
+
+            return period(0) == 1
+                ? ChainType.ERGODIC
+                : ChainType.IRREDUCIBLE_PERIODIC;
+        }
+
+        // ----------------------------------------------------
+        // 6. STATIONARY DISTRIBUTION SERVICE
+        // ----------------------------------------------------
+
+        StationaryResult calculateStationary(
+            double tolerance,
+            int maxIterations
+        ) {
+            if (!Double.isFinite(tolerance) ||
+                tolerance <= 0 ||
+                maxIterations <= 0) {
+                throw new ProbabilityException(
+                    "Invalid stationary solver configuration."
+                );
+            }
+
+            double[] current = new double[size];
+            Arrays.fill(current, 1.0 / size);
+
+            for (int iteration = 1;
+                 iteration <= maxIterations;
+                 iteration++) {
+
+                double[] next = multiply(current);
+
+                double residual = 0;
+
+                for (int i = 0; i < size; i++) {
+                    residual = Math.max(
+                        residual,
+                        Math.abs(next[i] - current[i])
+                    );
+                }
+
+                current = next;
+
+                if (residual < tolerance) {
+                    return result(
+                        current,
+                        iteration,
+                        true,
+                        residual
+                    );
+                }
+            }
+
+            double[] next = multiply(current);
+
+            double residual = 0;
+
+            for (int i = 0; i < size; i++) {
+                residual = Math.max(
+                    residual,
+                    Math.abs(next[i] - current[i])
+                );
+            }
+
+            return result(
+                current,
+                maxIterations,
+                false,
+                residual
             );
         }
 
-        const gcd = (a, b) => b === 0 ? a : gcd(b, a % b);
+        private StationaryResult result(
+            double[] probabilities,
+            int iterations,
+            boolean converged,
+            double residual
+        ) {
+            List<Double> values = Arrays.stream(probabilities)
+                .boxed()
+                .collect(Collectors.toList());
 
-        let result = 0;
+            return new StationaryResult(
+                values,
+                iterations,
+                converged,
+                residual
+            );
+        }
+    }
 
-        this.matrix.forEach((row, source) => {
-            row.forEach((probability, destination) => {
-                if (probability > 0) {
-                    const difference = Math.abs(
-                        distances[source] + 1 - distances[destination]
+    // ========================================================
+    // 7. MARTINGALE POLICY AND ANALYSIS
+    // ========================================================
+
+    @FunctionalInterface
+    interface RewardPolicy {
+        double reward(int source, int destination);
+    }
+
+    static final class MartingaleService {
+
+        private final MarkovModel model;
+        private final RewardPolicy reward;
+        private final double[] conditionalMeans;
+
+        MartingaleService(
+            MarkovModel model,
+            RewardPolicy reward
+        ) {
+            this.model = Objects.requireNonNull(model);
+            this.reward = Objects.requireNonNull(reward);
+
+            this.conditionalMeans = new double[model.size()];
+
+            for (int source = 0;
+                 source < model.size();
+                 source++) {
+
+                for (int destination = 0;
+                     destination < model.size();
+                     destination++) {
+
+                    double value = reward.reward(
+                        source,
+                        destination
                     );
 
-                    result = gcd(result, difference);
+                    if (!Double.isFinite(value)) {
+                        throw new ProbabilityException(
+                            "Reward must be finite."
+                        );
+                    }
+
+                    conditionalMeans[source] +=
+                        model.probability(source, destination) * value;
                 }
-            });
-        });
+            }
+        }
+
+        double increment(int source, int destination) {
+            return reward.reward(source, destination)
+                - conditionalMeans[source];
+        }
+
+        boolean verify(double tolerance) {
+            for (int source = 0;
+                 source < model.size();
+                 source++) {
+
+                double expectation = 0;
+
+                for (int destination = 0;
+                     destination < model.size();
+                     destination++) {
+
+                    expectation +=
+                        model.probability(source, destination) *
+                        increment(source, destination);
+                }
+
+                if (Math.abs(expectation) > tolerance) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        List<Double> evaluate(List<Integer> path) {
+            if (path.size() < 2) {
+                throw new ProbabilityException(
+                    "Martingale path requires two observations."
+                );
+            }
+
+            List<Double> values = new ArrayList<>();
+            double cumulative = 0;
+
+            values.add(cumulative);
+
+            for (int i = 0; i < path.size() - 1; i++) {
+                int source = path.get(i);
+                int destination = path.get(i + 1);
+
+                if (source < 0 || destination < 0 ||
+                    source >= model.size() ||
+                    destination >= model.size() ||
+                    model.probability(source, destination) <= 0) {
+
+                    throw new ProbabilityException(
+                        "Observed transition is impossible."
+                    );
+                }
+
+                cumulative += increment(source, destination);
+                values.add(cumulative);
+            }
+
+            return List.copyOf(values);
+        }
+
+        double[] conditionalMeans() {
+            return conditionalMeans.clone();
+        }
+    }
+
+    // ========================================================
+    // 8. ENTERPRISE SIMULATION SERVICE
+    // ========================================================
+
+    static final class SimulationService {
+
+        private final MarkovModel model;
+        private final long seed;
+
+        SimulationService(MarkovModel model, long seed) {
+            this.model = Objects.requireNonNull(model);
+            this.seed = seed;
+        }
+
+        SimulationReport execute(
+            int initialState,
+            int steps,
+            StationaryResult stationary
+        ) {
+            if (initialState < 0 ||
+                initialState >= model.size() ||
+                steps < 0) {
+                throw new ProbabilityException(
+                    "Invalid simulation request."
+                );
+            }
+
+            if (stationary.probabilities().size() != model.size()) {
+                throw new ProbabilityException(
+                    "Stationary model mismatch."
+                );
+            }
+
+            String simulationId = "SIM-" +
+                Long.toUnsignedString(seed);
+
+            SimulationStatus status = SimulationStatus.CREATED;
+
+            try {
+                status = SimulationStatus.RUNNING;
+
+                SplittableRandom random =
+                    new SplittableRandom(seed);
+
+                int current = initialState;
+
+                long[] visits = new long[model.size()];
+                List<String> path = new ArrayList<>();
+
+                path.add(model.states().get(current));
+                visits[current]++;
+
+                for (int step = 0; step < steps; step++) {
+                    double draw = random.nextDouble();
+                    double cumulative = 0;
+
+                    int following = model.size() - 1;
+
+                    for (int destination = 0;
+                         destination < model.size();
+                         destination++) {
+
+                        cumulative +=
+                            model.probability(current, destination);
+
+                        if (draw < cumulative) {
+                            following = destination;
+                            break;
+                        }
+                    }
+
+                    current = following;
+                    visits[current]++;
+
+                    path.add(model.states().get(current));
+                }
+
+                Map<String, Double> empirical = new HashMap<>();
+                double total = steps + 1.0;
+                double maximumError = 0;
+
+                for (int i = 0; i < model.size(); i++) {
+                    double observed = visits[i] / total;
+
+                    empirical.put(
+                        model.states().get(i),
+                        observed
+                    );
+
+                    maximumError = Math.max(
+                        maximumError,
+                        Math.abs(
+                            observed -
+                            stationary.probabilities().get(i)
+                        )
+                    );
+                }
+
+                status = SimulationStatus.COMPLETED;
+
+                return new SimulationReport(
+                    simulationId,
+                    status,
+                    steps,
+                    path,
+                    empirical,
+                    maximumError
+                );
+
+            } catch (RuntimeException exception) {
+                status = SimulationStatus.FAILED;
+                throw new ProbabilityException(
+                    "Simulation failed with status " + status +
+                    ": " + exception.getMessage()
+                );
+            }
+        }
+    }
+
+    // ========================================================
+    // 9. LONG-RUN EXPECTED REWARD
+    // ========================================================
+
+    static double expectedLongRunReward(
+        StationaryResult stationary,
+        List<Double> rewards
+    ) {
+        if (stationary.probabilities().size() != rewards.size()) {
+            throw new ProbabilityException(
+                "Reward and stationary dimensions differ."
+            );
+        }
+
+        double result = 0;
+
+        for (int i = 0; i < rewards.size(); i++) {
+            result +=
+                stationary.probabilities().get(i) * rewards.get(i);
+        }
 
         return result;
     }
 
-    classify() {
-        if (!this.isIrreducible()) {
-            return "reducible";
-        }
+    // ========================================================
+    // 10. SAMPLE MODEL AND EXECUTION
+    // ========================================================
 
-        return this.period() === 1
-            ? "ergodic"
-            : "irreducible_periodic";
-    }
-}
-
-// ============================================================
-// 4. MARTINGALE REWARD PROCESS
-// ============================================================
-
-class MartingaleProcess {
-    constructor(model, rewardFunction) {
-        this.model = model;
-        this.rewardFunction = rewardFunction;
-
-        this.conditionalMeans = model.matrix.map((row, state) =>
-            row.reduce(
-                (sum, probability, destination) =>
-                    sum + probability *
-                    rewardFunction(state, destination),
-                0
-            )
+    private static MarkovModel createWeatherModel() {
+        List<String> states = List.of(
+            "Sunny",
+            "Cloudy",
+            "Rainy"
         );
+
+        List<Transition> transitions = List.of(
+            new Transition("Sunny", "Sunny", 0.70),
+            new Transition("Sunny", "Cloudy", 0.20),
+            new Transition("Sunny", "Rainy", 0.10),
+
+            new Transition("Cloudy", "Sunny", 0.25),
+            new Transition("Cloudy", "Cloudy", 0.50),
+            new Transition("Cloudy", "Rainy", 0.25),
+
+            new Transition("Rainy", "Sunny", 0.20),
+            new Transition("Rainy", "Cloudy", 0.30),
+            new Transition("Rainy", "Rainy", 0.50)
+        );
+
+        return new MarkovModel(states, transitions);
     }
 
-    increment(source, destination) {
-        return this.rewardFunction(source, destination)
-            - this.conditionalMeans[source];
-    }
-
-    verifyConditionalExpectations(tolerance = 1e-10) {
-        return this.model.matrix.every((row, source) => {
-            const expected = row.reduce(
-                (sum, probability, destination) =>
-                    sum + probability *
-                    this.increment(source, destination),
-                0
+    public static void main(String[] args) {
+        try {
+            System.out.println(
+                "ADVANCED PROBABILITY: ENTERPRISE MODEL"
             );
 
-            return Math.abs(expected) < tolerance;
-        });
-    }
+            MarkovModel model = createWeatherModel();
 
-    buildPath(path) {
-        if (!Array.isArray(path) || path.length < 2) {
-            throw new ProbabilityError("Path is too short.");
-        }
+            // Stationary analysis.
+            StationaryResult stationary =
+                model.calculateStationary(1e-12, 100000);
 
-        let cumulative = 0;
-        const values = [0];
-
-        for (let i = 0; i < path.length - 1; i++) {
-            const source = path[i];
-            const destination = path[i + 1];
-
-            if (!Number.isInteger(source) ||
-                !Number.isInteger(destination) ||
-                source < 0 || destination < 0 ||
-                source >= this.model.size ||
-                destination >= this.model.size ||
-                this.model.matrix[source][destination] <= 0) {
-                throw new ProbabilityError("Invalid observed transition.");
+            if (!stationary.converged()) {
+                throw new ProbabilityException(
+                    "Stationary solver did not converge."
+                );
             }
 
-            cumulative += this.increment(source, destination);
-            values.push(cumulative);
-        }
+            System.out.println("\n1. STATIONARY DISTRIBUTION");
 
-        return values;
-    }
-}
-
-// ============================================================
-// 5. ONLINE STATISTICS
-// ============================================================
-
-class OnlineStatistics {
-    constructor(size) {
-        this.visits = new Array(size).fill(0);
-        this.transitions = new Map();
-        this.total = 0;
-    }
-
-    record(source, destination) {
-        this.visits[destination]++;
-        this.total++;
-
-        const key = `${source}:${destination}`;
-
-        this.transitions.set(
-            key,
-            (this.transitions.get(key) || 0) + 1
-        );
-    }
-
-    distribution() {
-        if (this.total === 0) {
-            return this.visits.map(() => 0);
-        }
-
-        return this.visits.map(value => value / this.total);
-    }
-}
-
-// ============================================================
-// 6. EVENT-DRIVEN ASYNCHRONOUS SIMULATOR
-// ============================================================
-
-class StochasticSimulator extends EventEmitter {
-    constructor(model, seed = 2026) {
-        super();
-
-        this.model = model;
-        this.rng = new RandomGenerator(seed);
-        this.statistics = new OnlineStatistics(model.size);
-        this.id = randomUUID();
-        this.running = false;
-        this.stepNumber = 0;
-    }
-
-    async run(initialState, steps, batchSize = 1000) {
-        if (this.running) {
-            throw new ProbabilityError("Simulation is already running.");
-        }
-
-        if (!Number.isInteger(initialState) ||
-            initialState < 0 ||
-            initialState >= this.model.size) {
-            throw new ProbabilityError("Invalid initial state.");
-        }
-
-        if (!Number.isInteger(steps) || steps < 0 ||
-            !Number.isInteger(batchSize) || batchSize <= 0) {
-            throw new ProbabilityError("Invalid simulation parameters.");
-        }
-
-        this.running = true;
-
-        let current = initialState;
-
-        try {
-            this.emit("started", {
-                id: this.id,
-                initialState,
-                steps
-            });
-
-            for (let i = 0; i < steps; i++) {
-                const following = this.model.transition(current, this.rng);
-
-                this.statistics.record(current, following);
-
-                current = following;
-                this.stepNumber++;
-
-                this.emit("transition", {
-                    step: this.stepNumber,
-                    state: current,
-                    label: this.model.states[current]
-                });
-
-                // Yield control periodically to avoid blocking Node.js.
-                if ((i + 1) % batchSize === 0) {
-                    await new Promise(resolve => setImmediate(resolve));
-
-                    this.emit("progress", {
-                        completed: i + 1,
-                        total: steps
-                    });
-                }
+            for (int i = 0; i < model.size(); i++) {
+                System.out.printf(
+                    "%-12s %.6f%n",
+                    model.states().get(i),
+                    stationary.probabilities().get(i)
+                );
             }
 
-            const result = {
-                id: this.id,
-                steps: this.stepNumber,
-                finalState: current,
-                empiricalDistribution: this.statistics.distribution(),
-                transitions: Object.fromEntries(this.statistics.transitions)
-            };
+            System.out.println("Iterations: " + stationary.iterations());
+            System.out.println("Residual: " + stationary.residual());
 
-            this.emit("completed", result);
+            // Chain properties.
+            System.out.println("\n2. ERGODICITY");
 
-            return result;
-        } catch (error) {
-            this.emit("failed", error);
-            throw error;
-        } finally {
-            this.running = false;
+            System.out.println(
+                "Irreducible: " + model.isIrreducible()
+            );
+
+            System.out.println(
+                "Period: " + model.period(0)
+            );
+
+            System.out.println(
+                "Classification: " + model.classify()
+            );
+
+            // Enterprise simulation.
+            System.out.println("\n3. SIMULATION");
+
+            SimulationService service =
+                new SimulationService(model, 2026);
+
+            SimulationReport report = service.execute(
+                model.indexOf("Sunny"),
+                100000,
+                stationary
+            );
+
+            System.out.println("Simulation ID: " +
+                report.simulationId());
+
+            System.out.println("Status: " + report.status());
+
+            System.out.println("Transitions: " +
+                report.transitions());
+
+            System.out.println("Empirical distribution:");
+
+            report.empiricalDistribution().forEach(
+                (state, probability) ->
+                    System.out.printf(
+                        "%-12s %.6f%n",
+                        state,
+                        probability
+                    )
+            );
+
+            System.out.println(
+                "Maximum error: " + report.maximumError()
+            );
+
+            // Martingale analysis.
+            System.out.println("\n4. MARTINGALE");
+
+            MartingaleService martingale =
+                new MartingaleService(
+                    model,
+                    (source, destination) ->
+                        destination - source
+                );
+
+            System.out.println(
+                "Conditional expectation verified: " +
+                martingale.verify(1e-10)
+            );
+
+            List<Integer> path = List.of(
+                0, 1, 2, 1, 0, 0, 2, 1
+            );
+
+            System.out.println(
+                "Martingale values: " +
+                martingale.evaluate(path)
+            );
+
+            // Long-run reward.
+            System.out.println("\n5. LONG-RUN REWARD");
+
+            double expectedReward = expectedLongRunReward(
+                stationary,
+                List.of(100.0, 60.0, 20.0)
+            );
+
+            System.out.println(
+                "Expected reward: " + expectedReward
+            );
+
+            // Periodic-chain test.
+            System.out.println("\n6. PERIODIC MODEL");
+
+            MarkovModel periodic = new MarkovModel(
+                List.of("A", "B"),
+                List.of(
+                    new Transition("A", "B", 1),
+                    new Transition("B", "A", 1)
+                )
+            );
+
+            System.out.println(
+                "Period: " + periodic.period(0)
+            );
+
+            System.out.println(
+                "Classification: " + periodic.classify()
+            );
+
+            System.out.println(
+                "Power iteration converged: " +
+                periodic.calculateStationary(1e-12, 100).converged()
+            );
+
+            // Reducible-chain test.
+            System.out.println("\n7. REDUCIBLE MODEL");
+
+            MarkovModel reducible = new MarkovModel(
+                List.of("Transient", "Absorbing"),
+                List.of(
+                    new Transition("Transient", "Transient", 0.8),
+                    new Transition("Transient", "Absorbing", 0.2),
+                    new Transition("Absorbing", "Transient", 0.0),
+                    new Transition("Absorbing", "Absorbing", 1.0)
+                )
+            );
+
+            System.out.println(
+                "Classification: " + reducible.classify()
+            );
+
+            System.out.println("\n8. VALIDATION");
+
+            try {
+                new Transition("A", "B", 1.5);
+            } catch (ProbabilityException exception) {
+                System.out.println(
+                    "Invalid transition rejected: " +
+                    exception.getMessage()
+                );
+            }
+
+            System.out.println("\nExecution completed.");
+
+        } catch (ProbabilityException exception) {
+            System.err.println(
+                "Probability error: " + exception.getMessage()
+            );
+
+            System.exitCode(1);
+        } catch (RuntimeException exception) {
+            System.err.println(
+                "Execution error: " + exception.getMessage()
+            );
+
+            System.exitCode(1);
         }
     }
 }
-
-// ============================================================
-// 7. EXPERIMENT
-// ============================================================
-
-async function main() {
-    const model = new MarkovModel(
-        ["Sunny", "Cloudy", "Rainy"],
-        [
-            [0.70, 0.20, 0.10],
-            [0.25, 0.50, 0.25],
-            [0.20, 0.30, 0.50]
-        ]
-    );
-
-    console.log("ADVANCED PROBABILITY");
-    console.log("====================");
-
-    console.log("\nStationary distribution:");
-
-    const stationary = model.stationary();
-
-    if (!stationary.converged) {
-        throw new Error("Stationary iteration failed.");
-    }
-
-    console.table(
-        model.states.map((state, index) => ({
-            state,
-            probability: stationary.distribution[index]
-        }))
-    );
-
-    console.log("Iterations:", stationary.iterations);
-    console.log("Classification:", model.classify());
-    console.log("Period:", model.period());
-
-    // Conditional reward and martingale difference.
-    const reward = (source, destination) => destination - source;
-
-    const martingale = new MartingaleProcess(model, reward);
-
-    console.log(
-        "\nConditional expectations valid:",
-        martingale.verifyConditionalExpectations()
-    );
-
-    // Subscribe to selected simulation events.
-    const simulator = new StochasticSimulator(model, 2026);
-
-    simulator.on("started", event => {
-        console.log("\nSimulation started:", event.id);
-    });
-
-    simulator.on("progress", event => {
-        console.log(
-            `Progress: ${event.completed}/${event.total}`
-        );
-    });
-
-    simulator.on("failed", error => {
-        console.error("Simulation failed:", error.message);
-    });
-
-    const result = await simulator.run(0, 100000, 10000);
-
-    console.log("\nEmpirical distribution:");
-
-    console.table(
-        model.states.map((state, index) => ({
-            state,
-            probability: result.empiricalDistribution[index]
-        }))
-    );
-
-    console.log(
-        "Maximum distribution error:",
-        maxDifference(
-            stationary.distribution,
-            result.empiricalDistribution
-        )
-    );
-
-    // Verify martingale behavior on an observed path.
-    const path = [0, 1, 2, 1, 0, 0, 2, 1];
-
-    const martingaleValues = martingale.buildPath(path);
-
-    console.log("\nMartingale path:", martingaleValues);
-
-    // Periodic chain.
-    const periodic = new MarkovModel(
-        ["A", "B"],
-        [
-            [0, 1],
-            [1, 0]
-        ]
-    );
-
-    console.log("\nPeriodic chain:");
-    console.log("Period:", periodic.period());
-    console.log("Classification:", periodic.classify());
-    console.log(
-        "Power iteration:",
-        periodic.stationary(1e-12, 100).converged
-    );
-
-    // Reducible chain.
-    const reducible = new MarkovModel(
-        ["A", "B"],
-        [
-            [0.8, 0.2],
-            [0, 1]
-        ]
-    );
-
-    console.log("\nReducible chain:", reducible.classify());
-
-    console.log("\nExperiment completed.");
-}
-
-main().catch(error => {
-    console.error("Fatal error:", error.message);
-    process.exitCode = 1;
-});
