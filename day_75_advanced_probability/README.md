@@ -1,1182 +1,1013 @@
--- ============================================================
--- ADVANCED PROBABILITY
--- PostgreSQL stochastic modeling and Markov-chain database
--- ============================================================
---
--- Implements:
--- 1. Probability model management
--- 2. Finite-state Markov chains
--- 3. Transition probability validation
--- 4. Stationary distribution computation
--- 5. Simulation trajectories
--- 6. Martingale difference observations
--- 7. Long-run reward evaluation
--- 8. Ergodicity metadata and reporting
---
--- PostgreSQL 14+
---
--- The stationary solver uses row-vector multiplication:
--- pi_next[j] = SUM(pi[i] * P[i,j]).
---
--- Power iteration can fail to converge for periodic chains.
--- A non-converged result is explicitly reported.
+# Advanced Probability: Martingales, Stationary Distributions, Ergodicity and Stochastic Modeling
 
-BEGIN;
+## Mathematical Scope
 
-DROP SCHEMA IF EXISTS advanced_probability CASCADE;
+This project develops a computational framework for studying discrete-time stochastic processes, with particular emphasis on finite-state Markov chains, stationary probability distributions, ergodicity and martingales.
 
-CREATE SCHEMA advanced_probability;
+A stochastic process is a sequence of random variables defined on a probability space:
 
-SET search_path TO advanced_probability, public;
+\[
+X_0,X_1,X_2,\ldots
+\]
 
--- ============================================================
--- 1. ENUMERATED DOMAIN TYPES
--- ============================================================
+The process describes the evolution of a random system over time. Its behavior is determined by the underlying probability structure, transition mechanisms and information available at each time.
 
-CREATE TYPE model_status AS ENUM (
-    'draft',
-    'validated',
-    'active',
-    'retired'
-);
+The implementations use a three-state weather process as their principal example:
 
-CREATE TYPE chain_classification AS ENUM (
-    'ergodic',
-    'irreducible_periodic',
-    'reducible',
-    'unclassified'
-);
+- Sunny
+- Cloudy
+- Rainy
 
-CREATE TYPE simulation_status AS ENUM (
-    'created',
-    'running',
-    'completed',
-    'failed'
-);
+The weather example provides a consistent transition model for comparing theoretical probabilities, numerical calculations and simulated observations.
 
--- ============================================================
--- 2. STOCHASTIC MODELS
--- ============================================================
+## Mathematical Foundations
 
-CREATE TABLE stochastic_models (
-    model_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+### Probability distributions and expectation
 
-    model_name VARCHAR(150) NOT NULL UNIQUE,
+A discrete random variable \(X\) has probability mass function:
 
-    description TEXT NOT NULL,
+\[
+p(x)=P(X=x)
+\]
 
-    status model_status NOT NULL DEFAULT 'draft',
+The probabilities satisfy:
 
-    classification chain_classification
-        NOT NULL DEFAULT 'unclassified',
+\[
+p(x)\geq 0
+\]
 
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+and
 
-    CHECK (length(trim(model_name)) > 0)
-);
+\[
+\sum_x p(x)=1
+\]
 
--- ============================================================
--- 3. STATES
--- ============================================================
+The expectation of a discrete random variable is:
 
-CREATE TABLE model_states (
-    state_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+\[
+E[X]=\sum_x xp(x)
+\]
 
-    model_id BIGINT NOT NULL
-        REFERENCES stochastic_models(model_id)
-        ON DELETE CASCADE,
+Its variance is:
 
-    state_code VARCHAR(40) NOT NULL,
+\[
+Var(X)=E[(X-E[X])^2]
+\]
 
-    state_name VARCHAR(100) NOT NULL,
+The Python implementation includes reusable functions for normalization, categorical sampling, expectation and variance.
 
-    state_reward NUMERIC(16,6) NOT NULL DEFAULT 0,
+The other implementations concentrate on stochastic transition systems and their computational analysis.
 
-    is_absorbing BOOLEAN NOT NULL DEFAULT FALSE,
+### Stochastic processes
 
-    UNIQUE (model_id, state_code),
+A stochastic process represents a collection of random variables indexed by time.
 
-    UNIQUE (model_id, state_id),
+Different processes are distinguished by their dependence structures, state spaces and transition mechanisms.
 
-    CHECK (length(trim(state_code)) > 0),
+Important categories include:
 
-    CHECK (length(trim(state_name)) > 0)
-);
+| Process | Main characteristic |
+|---|---|
+| Independent process | Observations are independent |
+| Markov process | Future behavior depends on the present state |
+| Stationary process | Joint distributions remain invariant under time shifts |
+| Martingale | Conditional future expectation equals the present value |
+| Random walk | Successive changes follow a specified random increment distribution |
 
-CREATE INDEX idx_model_states_model
-    ON model_states(model_id);
+These categories describe different mathematical properties. A process can possess more than one property.
 
--- ============================================================
--- 4. TRANSITION MATRIX
--- ============================================================
+## Markov Chains
 
-CREATE TABLE transitions (
-    transition_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+### Definition
 
-    model_id BIGINT NOT NULL,
+A discrete-time Markov chain satisfies the Markov property:
 
-    source_state_id BIGINT NOT NULL,
+\[
+P(X_{n+1}=j\mid X_n=i,X_{n-1},\ldots,X_0)
+=
+P(X_{n+1}=j\mid X_n=i)
+\]
 
-    destination_state_id BIGINT NOT NULL,
+The current state contains all information from the past needed to determine the conditional distribution of the next state.
 
-    probability NUMERIC(18,15) NOT NULL,
+For a finite-state Markov chain, transition probabilities are represented by a matrix:
 
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+\[
+P=
+\begin{bmatrix}
+p_{11}&p_{12}&\cdots&p_{1n}\\
+p_{21}&p_{22}&\cdots&p_{2n}\\
+\vdots&\vdots&\ddots&\vdots\\
+p_{n1}&p_{n2}&\cdots&p_{nn}
+\end{bmatrix}
+\]
 
-    FOREIGN KEY (model_id, source_state_id)
-        REFERENCES model_states(model_id, state_id)
-        ON DELETE CASCADE,
+Each entry represents:
 
-    FOREIGN KEY (model_id, destination_state_id)
-        REFERENCES model_states(model_id, state_id)
-        ON DELETE CASCADE,
+\[
+p_{ij}=P(X_{t+1}=j\mid X_t=i)
+\]
 
-    UNIQUE (
-        model_id,
-        source_state_id,
-        destination_state_id
-    ),
+Every entry must be nonnegative, and every row must sum to one:
 
-    CHECK (probability >= 0 AND probability <= 1)
-);
+\[
+\sum_jp_{ij}=1
+\]
 
-CREATE INDEX idx_transitions_source
-    ON transitions(model_id, source_state_id);
+The matrix is therefore row-stochastic.
 
-CREATE INDEX idx_transitions_destination
-    ON transitions(model_id, destination_state_id);
+### Weather transition model
 
--- ============================================================
--- 5. SIMULATION RECORDS
--- ============================================================
+The implementations use:
 
-CREATE TABLE simulations (
-    simulation_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+| Current state | Sunny | Cloudy | Rainy |
+|---|---:|---:|---:|
+| Sunny | 0.70 | 0.20 | 0.10 |
+| Cloudy | 0.25 | 0.50 | 0.25 |
+| Rainy | 0.20 | 0.30 | 0.50 |
 
-    model_id BIGINT NOT NULL
-        REFERENCES stochastic_models(model_id),
+For example:
 
-    initial_state_id BIGINT NOT NULL,
+\[
+P(X_{t+1}=\text{Rainy}\mid X_t=\text{Sunny})=0.10
+\]
 
-    random_seed BIGINT NOT NULL,
+The model represents a conditional transition mechanism, not a claim about actual meteorological frequencies.
 
-    requested_steps BIGINT NOT NULL,
+### Distribution evolution
 
-    status simulation_status NOT NULL DEFAULT 'created',
+Let the initial probability distribution be a row vector:
 
-    started_at TIMESTAMPTZ,
+\[
+\pi_0=
+\begin{bmatrix}
+p_1&p_2&\cdots&p_n
+\end{bmatrix}
+\]
 
-    completed_at TIMESTAMPTZ,
+The distribution after one transition is:
 
-    failure_reason TEXT,
+\[
+\pi_1=\pi_0P
+\]
 
-    FOREIGN KEY (model_id, initial_state_id)
-        REFERENCES model_states(model_id, state_id),
+After \(k\) transitions:
 
-    CHECK (requested_steps >= 0),
+\[
+\pi_k=\pi_0P^k
+\]
 
-    CHECK (
-        completed_at IS NULL
-        OR started_at IS NULL
-        OR completed_at >= started_at
-    )
-);
+This relationship is implemented in all four programming-language models.
 
-CREATE INDEX idx_simulations_model_status
-    ON simulations(model_id, status);
+### Transition simulation
 
--- ============================================================
--- 6. OBSERVED TRAJECTORIES
--- ============================================================
+A simulated transition selects a destination state according to the probability distribution associated with the current state.
 
-CREATE TABLE trajectory_observations (
-    simulation_id BIGINT NOT NULL
-        REFERENCES simulations(simulation_id)
-        ON DELETE CASCADE,
+The procedure is:
 
-    step_number BIGINT NOT NULL,
+1. Read the current state.
+2. Obtain its transition probabilities.
+3. Generate a random value.
+4. Select the destination using cumulative probabilities.
+5. Record the transition.
+6. Continue from the destination state.
 
-    state_id BIGINT NOT NULL
-        REFERENCES model_states(state_id),
+Simulation produces an individual realization of the stochastic process.
 
-    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+It does not directly calculate the theoretical probability distribution.
 
-    PRIMARY KEY (simulation_id, step_number),
+## Stationary Distributions
 
-    CHECK (step_number >= 0)
-);
+### Definition
 
-CREATE INDEX idx_trajectory_state
-    ON trajectory_observations(state_id, simulation_id);
+A stationary distribution is a probability vector that remains unchanged after applying the transition matrix:
 
--- ============================================================
--- 7. MARTINGALE DIFFERENCE OBSERVATIONS
--- ============================================================
+\[
+\pi P=\pi
+\]
 
-CREATE TABLE martingale_observations (
-    simulation_id BIGINT NOT NULL,
+It also satisfies:
 
-    step_number BIGINT NOT NULL,
+\[
+\sum_i\pi_i=1
+\]
 
-    source_state_id BIGINT NOT NULL
-        REFERENCES model_states(state_id),
+and
 
-    destination_state_id BIGINT NOT NULL
-        REFERENCES model_states(state_id),
+\[
+\pi_i\geq0
+\]
 
-    observed_reward NUMERIC(18,8) NOT NULL,
+The stationary distribution describes an invariant probability distribution of the Markov chain.
 
-    conditional_expected_reward NUMERIC(18,8) NOT NULL,
+It is not automatically the distribution reached from every initial condition. That stronger convergence property requires additional assumptions.
 
-    martingale_increment NUMERIC(18,8)
-        GENERATED ALWAYS AS (
-            observed_reward - conditional_expected_reward
-        ) STORED,
-
-    PRIMARY KEY (simulation_id, step_number),
-
-    FOREIGN KEY (simulation_id, step_number)
-        REFERENCES trajectory_observations(
-            simulation_id,
-            step_number
-        )
-        DEFERRABLE INITIALLY DEFERRED
-);
-
--- ============================================================
--- 8. MODEL VALIDATION FUNCTION
--- ============================================================
-
-CREATE OR REPLACE FUNCTION validate_transition_matrix(
-    p_model_id BIGINT,
-    p_tolerance NUMERIC DEFAULT 0.000000000001
-)
-RETURNS TABLE (
-    source_state_id BIGINT,
-    probability_sum NUMERIC,
-    is_valid BOOLEAN
-)
-LANGUAGE SQL
-STABLE
-AS $$
-    SELECT
-        s.state_id,
-        COALESCE(SUM(t.probability), 0)::NUMERIC,
-        ABS(COALESCE(SUM(t.probability), 0) - 1)
-            <= p_tolerance
-    FROM model_states s
-    LEFT JOIN transitions t
-        ON t.model_id = s.model_id
-       AND t.source_state_id = s.state_id
-    WHERE s.model_id = p_model_id
-    GROUP BY s.state_id
-    ORDER BY s.state_id;
-$$;
-
--- ============================================================
--- 9. MODEL ACTIVATION PROCEDURE
--- ============================================================
-
-CREATE OR REPLACE PROCEDURE activate_model(
-    p_model_id BIGINT
-)
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_state_count BIGINT;
-    v_invalid_count BIGINT;
-BEGIN
-    SELECT COUNT(*)
-    INTO v_state_count
-    FROM model_states
-    WHERE model_id = p_model_id;
-
-    IF v_state_count = 0 THEN
-        RAISE EXCEPTION
-            'Cannot activate a model without states: %',
-            p_model_id;
-    END IF;
-
-    SELECT COUNT(*)
-    INTO v_invalid_count
-    FROM validate_transition_matrix(p_model_id)
-    WHERE NOT is_valid;
-
-    IF v_invalid_count > 0 THEN
-        RAISE EXCEPTION
-            'Transition matrix has % invalid rows.',
-            v_invalid_count;
-    END IF;
-
-    UPDATE stochastic_models
-    SET status = 'active'
-    WHERE model_id = p_model_id
-      AND status IN ('draft', 'validated');
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION
-            'Model cannot be activated from its current state.';
-    END IF;
-END;
-$$;
-
--- ============================================================
--- 10. STATIONARY DISTRIBUTION FUNCTION
--- ============================================================
-
-CREATE OR REPLACE FUNCTION calculate_stationary_distribution(
-    p_model_id BIGINT,
-    p_tolerance DOUBLE PRECISION DEFAULT 1e-12,
-    p_max_iterations INTEGER DEFAULT 100000
-)
-RETURNS TABLE (
-    state_id BIGINT,
-    state_code VARCHAR,
-    stationary_probability DOUBLE PRECISION,
-    converged BOOLEAN,
-    iterations INTEGER,
-    residual DOUBLE PRECISION
-)
-LANGUAGE plpgsql
-STABLE
-AS $$
-DECLARE
-    v_ids BIGINT[];
-    v_codes VARCHAR[];
-    v_n INTEGER;
-
-    v_current DOUBLE PRECISION[];
-    v_next DOUBLE PRECISION[];
-
-    v_i INTEGER;
-    v_j INTEGER;
-    v_iteration INTEGER;
-
-    v_sum DOUBLE PRECISION;
-    v_error DOUBLE PRECISION;
-    v_residual DOUBLE PRECISION;
-
-    v_converged BOOLEAN := FALSE;
-BEGIN
-    IF p_tolerance <= 0 OR NOT isfinite(p_tolerance) THEN
-        RAISE EXCEPTION 'Tolerance must be finite and positive.';
-    END IF;
-
-    IF p_max_iterations <= 0 THEN
-        RAISE EXCEPTION 'Iteration limit must be positive.';
-    END IF;
-
-    SELECT
-        array_agg(state_id ORDER BY state_id),
-        array_agg(state_code ORDER BY state_id)
-    INTO v_ids, v_codes
-    FROM model_states
-    WHERE model_id = p_model_id;
-
-    v_n := COALESCE(array_length(v_ids, 1), 0);
-
-    IF v_n = 0 THEN
-        RAISE EXCEPTION 'Model has no states.';
-    END IF;
-
-    IF EXISTS (
-        SELECT 1
-        FROM validate_transition_matrix(p_model_id)
-        WHERE NOT is_valid
-    ) THEN
-        RAISE EXCEPTION 'Invalid transition matrix.';
-    END IF;
-
-    v_current := array_fill(1.0 / v_n, ARRAY[v_n]);
-
-    FOR v_iteration IN 1..p_max_iterations LOOP
-        v_next := array_fill(0.0, ARRAY[v_n]);
-
-        FOR v_i IN 1..v_n LOOP
-            FOR v_j IN 1..v_n LOOP
-
-                SELECT COALESCE(SUM(t.probability), 0)::DOUBLE PRECISION
-                INTO v_sum
-                FROM transitions t
-                WHERE t.model_id = p_model_id
-                  AND t.source_state_id = v_ids[v_i]
-                  AND t.destination_state_id = v_ids[v_j];
-
-                v_next[v_j] := v_next[v_j]
-                    + v_current[v_i] * v_sum;
-            END LOOP;
-        END LOOP;
-
-        v_error := 0;
-
-        FOR v_i IN 1..v_n LOOP
-            v_error := GREATEST(
-                v_error,
-                ABS(v_next[v_i] - v_current[v_i])
-            );
-        END LOOP;
-
-        v_current := v_next;
-
-        IF v_error < p_tolerance THEN
-            v_converged := TRUE;
-            EXIT;
-        END IF;
-    END LOOP;
-
-    v_residual := 0;
-
-    -- Independently verify pi P = pi.
-    FOR v_j IN 1..v_n LOOP
-        v_sum := 0;
-
-        FOR v_i IN 1..v_n LOOP
-            SELECT COALESCE(SUM(t.probability), 0)::DOUBLE PRECISION
-            INTO STRICT v_error
-            FROM transitions t
-            WHERE t.model_id = p_model_id
-              AND t.source_state_id = v_ids[v_i]
-              AND t.destination_state_id = v_ids[v_j];
-
-            v_sum := v_sum + v_current[v_i] * v_error;
-        END LOOP;
-
-        v_residual := GREATEST(
-            v_residual,
-            ABS(v_sum - v_current[v_j])
-        );
-    END LOOP;
-
-    FOR v_i IN 1..v_n LOOP
-        state_id := v_ids[v_i];
-        state_code := v_codes[v_i];
-        stationary_probability := v_current[v_i];
-        converged := v_converged;
-        iterations := v_iteration;
-        residual := v_residual;
-
-        RETURN NEXT;
-    END LOOP;
-END;
-$$;
-
--- ============================================================
--- 11. STATIONARY REWARD EVALUATION
--- ============================================================
-
-CREATE OR REPLACE FUNCTION calculate_long_run_reward(
-    p_model_id BIGINT,
-    p_tolerance DOUBLE PRECISION DEFAULT 1e-12,
-    p_max_iterations INTEGER DEFAULT 100000
-)
-RETURNS DOUBLE PRECISION
-LANGUAGE plpgsql
-STABLE
-AS $$
-DECLARE
-    v_reward DOUBLE PRECISION;
-BEGIN
-    SELECT SUM(
-        stationary_probability * s.state_reward
-    )
-    INTO v_reward
-    FROM calculate_stationary_distribution(
-        p_model_id,
-        p_tolerance,
-        p_max_iterations
-    ) d
-    JOIN model_states s
-      ON s.state_id = d.state_id
-    WHERE d.converged;
-
-    IF v_reward IS NULL THEN
-        RAISE EXCEPTION
-            'Stationary distribution did not converge.';
-    END IF;
-
-    RETURN v_reward;
-END;
-$$;
-
--- ============================================================
--- 12. TRAJECTORY VALIDATION TRIGGER
--- ============================================================
-
-CREATE OR REPLACE FUNCTION validate_trajectory_observation()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_model_id BIGINT;
-    v_previous_state BIGINT;
-    v_probability NUMERIC;
-BEGIN
-    SELECT model_id
-    INTO STRICT v_model_id
-    FROM simulations
-    WHERE simulation_id = NEW.simulation_id;
-
-    IF NOT EXISTS (
-        SELECT 1
-        FROM model_states
-        WHERE state_id = NEW.state_id
-          AND model_id = v_model_id
-    ) THEN
-        RAISE EXCEPTION
-            'Trajectory state does not belong to the simulation model.';
-    END IF;
-
-    IF NEW.step_number = 0 THEN
-        RETURN NEW;
-    END IF;
-
-    SELECT state_id
-    INTO v_previous_state
-    FROM trajectory_observations
-    WHERE simulation_id = NEW.simulation_id
-      AND step_number = NEW.step_number - 1;
-
-    IF v_previous_state IS NULL THEN
-        RAISE EXCEPTION
-            'Previous trajectory observation is missing.';
-    END IF;
-
-    SELECT probability
-    INTO v_probability
-    FROM transitions
-    WHERE model_id = v_model_id
-      AND source_state_id = v_previous_state
-      AND destination_state_id = NEW.state_id;
-
-    IF v_probability IS NULL OR v_probability <= 0 THEN
-        RAISE EXCEPTION
-            'Observed transition is impossible under the model.';
-    END IF;
-
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER trg_validate_trajectory
-BEFORE INSERT ON trajectory_observations
-FOR EACH ROW
-EXECUTE FUNCTION validate_trajectory_observation();
-
--- ============================================================
--- 13. SIMULATION COMPLETION PROCEDURE
--- ============================================================
-
-CREATE OR REPLACE PROCEDURE complete_simulation(
-    p_simulation_id BIGINT
-)
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_expected BIGINT;
-    v_actual BIGINT;
-BEGIN
-    SELECT requested_steps
-    INTO STRICT v_expected
-    FROM simulations
-    WHERE simulation_id = p_simulation_id
-      AND status = 'running'
-    FOR UPDATE;
-
-    SELECT COUNT(*)
-    INTO v_actual
-    FROM trajectory_observations
-    WHERE simulation_id = p_simulation_id;
-
-    IF v_actual <> v_expected + 1 THEN
-        RAISE EXCEPTION
-            'Expected % observations, found %.',
-            v_expected + 1,
-            v_actual;
-    END IF;
-
-    UPDATE simulations
-    SET status = 'completed',
-        completed_at = NOW()
-    WHERE simulation_id = p_simulation_id;
-END;
-$$;
-
--- ============================================================
--- 14. REPORTING VIEW
--- ============================================================
-
-CREATE VIEW model_state_reporting AS
-SELECT
-    m.model_id,
-    m.model_name,
-    m.status,
-    s.state_id,
-    s.state_code,
-    s.state_name,
-    s.state_reward,
-    s.is_absorbing,
-    COALESCE(
-        SUM(t.probability),
-        0
-    ) AS outgoing_probability
-FROM stochastic_models m
-JOIN model_states s
-    ON s.model_id = m.model_id
-LEFT JOIN transitions t
-    ON t.model_id = s.model_id
-   AND t.source_state_id = s.state_id
-GROUP BY
-    m.model_id,
-    m.model_name,
-    m.status,
-    s.state_id,
-    s.state_code,
-    s.state_name,
-    s.state_reward,
-    s.is_absorbing;
-
--- ============================================================
--- 15. SAMPLE WEATHER MODEL
--- ============================================================
-
-INSERT INTO stochastic_models (
-    model_name,
-    description,
-    status,
-    classification
-)
-VALUES (
-    'Weather-Markov-Model',
-    'Three-state stochastic weather process.',
-    'draft',
-    'ergodic'
-);
-
-INSERT INTO model_states (
-    model_id,
-    state_code,
-    state_name,
-    state_reward,
-    is_absorbing
-)
-SELECT
-    model_id,
-    sample.state_code,
-    sample.state_name,
-    sample.state_reward,
-    FALSE
-FROM stochastic_models m
-CROSS JOIN (
-    VALUES
-        ('SUN', 'Sunny', 100.0::NUMERIC),
-        ('CLD', 'Cloudy', 60.0::NUMERIC),
-        ('RAN', 'Rainy', 20.0::NUMERIC)
-) AS sample(
-    state_code,
-    state_name,
-    state_reward
-)
-WHERE m.model_name = 'Weather-Markov-Model';
-
-INSERT INTO transitions (
-    model_id,
-    source_state_id,
-    destination_state_id,
-    probability
-)
-SELECT
-    m.model_id,
-    source.state_id,
-    destination.state_id,
-    sample.probability
-FROM stochastic_models m
-JOIN (
-    VALUES
-        ('SUN', 'SUN', 0.70::NUMERIC),
-        ('SUN', 'CLD', 0.20::NUMERIC),
-        ('SUN', 'RAN', 0.10::NUMERIC),
-
-        ('CLD', 'SUN', 0.25::NUMERIC),
-        ('CLD', 'CLD', 0.50::NUMERIC),
-        ('CLD', 'RAN', 0.25::NUMERIC),
-
-        ('RAN', 'SUN', 0.20::NUMERIC),
-        ('RAN', 'CLD', 0.30::NUMERIC),
-        ('RAN', 'RAN', 0.50::NUMERIC)
-) AS sample(source_code, destination_code, probability)
-    ON TRUE
-JOIN model_states source
-    ON source.model_id = m.model_id
-   AND source.state_code = sample.source_code
-JOIN model_states destination
-    ON destination.model_id = m.model_id
-   AND destination.state_code = sample.destination_code
-WHERE m.model_name = 'Weather-Markov-Model';
-
--- ============================================================
--- 16. PERIODIC MODEL
--- ============================================================
-
-INSERT INTO stochastic_models (
-    model_name,
-    description,
-    status,
-    classification
-)
-VALUES (
-    'Alternating-Periodic-Model',
-    'Two-state deterministic alternating process.',
-    'draft',
-    'irreducible_periodic'
-);
-
-INSERT INTO model_states (
-    model_id,
-    state_code,
-    state_name
-)
-SELECT
-    model_id,
-    sample.state_code,
-    sample.state_name
-FROM stochastic_models m
-CROSS JOIN (
-    VALUES
-        ('A', 'State A'),
-        ('B', 'State B')
-) AS sample(state_code, state_name)
-WHERE m.model_name = 'Alternating-Periodic-Model';
-
-INSERT INTO transitions (
-    model_id,
-    source_state_id,
-    destination_state_id,
-    probability
-)
-SELECT
-    m.model_id,
-    source.state_id,
-    destination.state_id,
-    1.0
-FROM stochastic_models m
-JOIN model_states source
-    ON source.model_id = m.model_id
-JOIN model_states destination
-    ON destination.model_id = m.model_id
-WHERE m.model_name = 'Alternating-Periodic-Model'
-  AND (
-      (source.state_code = 'A' AND destination.state_code = 'B')
-      OR
-      (source.state_code = 'B' AND destination.state_code = 'A')
-  );
-
--- ============================================================
--- 17. REDUCIBLE MODEL
--- ============================================================
-
-INSERT INTO stochastic_models (
-    model_name,
-    description,
-    status,
-    classification
-)
-VALUES (
-    'Absorbing-Model',
-    'Transient state leading to an absorbing state.',
-    'draft',
-    'reducible'
-);
-
-INSERT INTO model_states (
-    model_id,
-    state_code,
-    state_name,
-    is_absorbing
-)
-SELECT
-    model_id,
-    sample.state_code,
-    sample.state_name,
-    sample.is_absorbing
-FROM stochastic_models m
-CROSS JOIN (
-    VALUES
-        ('T', 'Transient', FALSE),
-        ('ABS', 'Absorbing', TRUE)
-) AS sample(state_code, state_name, is_absorbing)
-WHERE m.model_name = 'Absorbing-Model';
-
-INSERT INTO transitions (
-    model_id,
-    source_state_id,
-    destination_state_id,
-    probability
-)
-SELECT
-    m.model_id,
-    source.state_id,
-    destination.state_id,
-    sample.probability
-FROM stochastic_models m
-JOIN (
-    VALUES
-        ('T', 'T', 0.8::NUMERIC),
-        ('T', 'ABS', 0.2::NUMERIC),
-        ('ABS', 'T', 0.0::NUMERIC),
-        ('ABS', 'ABS', 1.0::NUMERIC)
-) AS sample(source_code, destination_code, probability)
-    ON TRUE
-JOIN model_states source
-    ON source.model_id = m.model_id
-   AND source.state_code = sample.source_code
-JOIN model_states destination
-    ON destination.model_id = m.model_id
-   AND destination.state_code = sample.destination_code
-WHERE m.model_name = 'Absorbing-Model';
-
--- ============================================================
--- 18. ACTIVATE VALID MODELS
--- ============================================================
-
-CALL activate_model(
-    (SELECT model_id
-     FROM stochastic_models
-     WHERE model_name = 'Weather-Markov-Model')
-);
-
-CALL activate_model(
-    (SELECT model_id
-     FROM stochastic_models
-     WHERE model_name = 'Alternating-Periodic-Model')
-);
-
-CALL activate_model(
-    (SELECT model_id
-     FROM stochastic_models
-     WHERE model_name = 'Absorbing-Model')
-);
-
-COMMIT;
-
--- ============================================================
--- 19. TRANSITION MATRIX VALIDATION
--- ============================================================
-
-SELECT
-    m.model_name,
-    s.state_code,
-    validation.probability_sum,
-    validation.is_valid
-FROM stochastic_models m
-CROSS JOIN LATERAL
-    validate_transition_matrix(m.model_id) validation
-JOIN model_states s
-    ON s.state_id = validation.source_state_id
-ORDER BY m.model_name, s.state_code;
-
--- ============================================================
--- 20. MODEL RETRIEVAL
--- ============================================================
-
-SELECT *
-FROM model_state_reporting
-ORDER BY model_name, state_id;
-
--- ============================================================
--- 21. STATIONARY DISTRIBUTION
--- ============================================================
-
-SELECT
-    m.model_name,
-    d.state_code,
-    ROUND(d.stationary_probability::NUMERIC, 8)
-        AS stationary_probability,
-    d.converged,
-    d.iterations,
-    d.residual
-FROM stochastic_models m
-CROSS JOIN LATERAL
-    calculate_stationary_distribution(m.model_id) d
-WHERE m.model_name = 'Weather-Markov-Model'
-ORDER BY d.state_id;
-
--- ============================================================
--- 22. LONG-RUN EXPECTED REWARD
--- ============================================================
-
-SELECT
-    model_name,
-    calculate_long_run_reward(model_id)
-        AS expected_long_run_reward
-FROM stochastic_models
-WHERE model_name = 'Weather-Markov-Model';
-
--- ============================================================
--- 23. SIMULATION WORKFLOW
--- ============================================================
-
-BEGIN;
-
-INSERT INTO simulations (
-    model_id,
-    initial_state_id,
-    random_seed,
-    requested_steps,
-    status,
-    started_at
-)
-SELECT
-    m.model_id,
-    s.state_id,
-    2026,
-    5,
-    'running',
-    NOW()
-FROM stochastic_models m
-JOIN model_states s
-    ON s.model_id = m.model_id
-WHERE m.model_name = 'Weather-Markov-Model'
-  AND s.state_code = 'SUN';
-
--- Capture the generated simulation identifier.
-CREATE TEMP TABLE current_simulation
-ON COMMIT DROP
-AS
-SELECT MAX(simulation_id) AS simulation_id
-FROM simulations;
-
--- First observation.
-INSERT INTO trajectory_observations (
-    simulation_id,
-    step_number,
-    state_id
-)
-SELECT
-    cs.simulation_id,
-    0,
-    s.state_id
-FROM current_simulation cs
-JOIN simulations sim
-    ON sim.simulation_id = cs.simulation_id
-JOIN model_states s
-    ON s.state_id = sim.initial_state_id;
-
--- Valid transitions for the example trajectory:
--- SUN -> CLD -> RAN -> CLD -> SUN -> SUN
-
-INSERT INTO trajectory_observations (
-    simulation_id,
-    step_number,
-    state_id
-)
-SELECT
-    cs.simulation_id,
-    sample.step_number,
-    s.state_id
-FROM current_simulation cs
-CROSS JOIN (
-    VALUES
-        (1, 'CLD'),
-        (2, 'RAN'),
-        (3, 'CLD'),
-        (4, 'SUN'),
-        (5, 'SUN')
-) AS sample(step_number, state_code)
-JOIN current_simulation sim
-    ON TRUE
-JOIN simulations model
-    ON model.simulation_id = sim.simulation_id
-JOIN model_states s
-    ON s.model_id = model.model_id
-   AND s.state_code = sample.state_code;
-
-CALL complete_simulation(
-    (SELECT simulation_id FROM current_simulation)
-);
-
-COMMIT;
-
--- ============================================================
--- 24. TRAJECTORY RETRIEVAL
--- ============================================================
-
-SELECT
-    sim.simulation_id,
-    observation.step_number,
-    state.state_code,
-    state.state_name,
-    observation.observed_at
-FROM simulations sim
-JOIN trajectory_observations observation
-    ON observation.simulation_id = sim.simulation_id
-JOIN model_states state
-    ON state.state_id = observation.state_id
-ORDER BY sim.simulation_id, observation.step_number;
-
--- ============================================================
--- 25. EMPIRICAL STATE DISTRIBUTION
--- ============================================================
-
-SELECT
-    state.state_code,
-    COUNT(*) AS visits,
-    ROUND(
-        COUNT(*)::NUMERIC /
-        SUM(COUNT(*)) OVER (),
-        6
-    ) AS empirical_probability
-FROM trajectory_observations observation
-JOIN model_states state
-    ON state.state_id = observation.state_id
-GROUP BY state.state_code
-ORDER BY state.state_code;
-
--- ============================================================
--- 26. MARTINGALE DIFFERENCE RECORDING
--- ============================================================
-
--- Reward is the difference between destination and source
--- state index. Conditional expectation is computed from
--- the transition matrix.
-
-INSERT INTO martingale_observations (
-    simulation_id,
-    step_number,
-    source_state_id,
-    destination_state_id,
-    observed_reward,
-    conditional_expected_reward
-)
-SELECT
-    current.simulation_id,
-    destination_observation.step_number,
-    source_observation.state_id,
-    destination_observation.state_id,
-
-    destination_state.state_id::NUMERIC -
-        source_state.state_id::NUMERIC,
-
-    SUM(
-        transition.probability *
-        (
-            expected_state.state_id::NUMERIC -
-            source_state.state_id::NUMERIC
-        )
-    )
-
-FROM current_simulation current
-JOIN trajectory_observations source_observation
-    ON source_observation.simulation_id =
-       current.simulation_id
-JOIN trajectory_observations destination_observation
-    ON destination_observation.simulation_id =
-       source_observation.simulation_id
-   AND destination_observation.step_number =
-       source_observation.step_number + 1
-
-JOIN source_state
-    ON source_state.state_id = source_observation.state_id
-JOIN destination_state
-    ON destination_state.state_id =
-       destination_observation.state_id
-
-JOIN simulations simulation
-    ON simulation.simulation_id =
-       current.simulation_id
-
-JOIN transitions transition
-    ON transition.model_id = simulation.model_id
-   AND transition.source_state_id =
-       source_state.state_id
-
-JOIN model_states expected_state
-    ON expected_state.state_id =
-       transition.destination_state_id
-
-GROUP BY
-    current.simulation_id,
-    destination_observation.step_number,
-    source_observation.state_id,
-    destination_observation.state_id;
-
--- ============================================================
--- 27. MARTINGALE REPORT
--- ============================================================
-
-SELECT
-    simulation_id,
-    step_number,
-    observed_reward,
-    conditional_expected_reward,
-    martingale_increment,
-    SUM(martingale_increment) OVER (
-        PARTITION BY simulation_id
-        ORDER BY step_number
-        ROWS BETWEEN UNBOUNDED PRECEDING
-        AND CURRENT ROW
-    ) AS cumulative_martingale
-FROM martingale_observations
-ORDER BY simulation_id, step_number;
-
--- ============================================================
--- 28. AGGREGATE MARTINGALE DIAGNOSTICS
--- ============================================================
-
-SELECT
-    simulation_id,
-    COUNT(*) AS observation_count,
-    AVG(martingale_increment) AS average_increment,
-    VAR_POP(martingale_increment) AS increment_variance,
-    MIN(martingale_increment) AS minimum_increment,
-    MAX(martingale_increment) AS maximum_increment
-FROM martingale_observations
-GROUP BY simulation_id;
-
--- ============================================================
--- 29. FAILURE CASE: INVALID PROBABILITY ROW
--- ============================================================
-
--- This query identifies incomplete or invalid matrix rows.
--- It does not modify the active model.
-
-SELECT
-    model_id,
-    source_state_id,
-    probability_sum,
-    is_valid
-FROM (
-    SELECT
-        model_id,
-        source_state_id,
-        SUM(probability) AS probability_sum,
-        ABS(SUM(probability) - 1) <= 0.000000000001
-            AS is_valid
-    FROM transitions
-    GROUP BY model_id, source_state_id
-) validation
-WHERE NOT is_valid;
-
--- ============================================================
--- 30. FINAL MODEL STATUS REPORT
--- ============================================================
-
-SELECT
-    m.model_name,
-    m.status,
-    m.classification,
-    COUNT(DISTINCT s.state_id) AS number_of_states,
-    COUNT(DISTINCT t.transition_id) AS number_of_transitions,
-    COUNT(DISTINCT sim.simulation_id) AS number_of_simulations
-FROM stochastic_models m
-LEFT JOIN model_states s
-    ON s.model_id = m.model_id
-LEFT JOIN transitions t
-    ON t.model_id = m.model_id
-LEFT JOIN simulations sim
-    ON sim.model_id = m.model_id
-GROUP BY
-    m.model_id,
-    m.model_name,
-    m.status,
-    m.classification
-ORDER BY m.model_name;
+### Power iteration
+
+The implementations estimate stationary distributions through repeated matrix multiplication:
+
+\[
+\pi^{(k+1)}=\pi^{(k)}P
+\]
+
+The computation begins with a uniform probability distribution.
+
+Convergence is measured using the maximum absolute difference:
+
+\[
+\epsilon_k=
+\max_i
+|\pi_i^{(k+1)}-\pi_i^{(k)}|
+\]
+
+The calculation stops when:
+
+\[
+\epsilon_k<\epsilon
+\]
+
+where \(\epsilon\) is the numerical tolerance.
+
+The final distribution is also checked against the stationary equation.
+
+A small residual indicates numerical agreement with the invariant-distribution equation.
+
+### Important distinction
+
+A stationary distribution and convergence to a stationary distribution are separate concepts.
+
+A periodic irreducible chain can possess a stationary distribution while ordinary power iteration oscillates instead of converging.
+
+The implementations explicitly report non-convergence instead of incorrectly presenting an intermediate iteration as a converged solution.
+
+### Long-run rewards
+
+Suppose each state has an associated reward:
+
+\[
+r(1),r(2),\ldots,r(n)
+\]
+
+For a chain with stationary distribution \(\pi\), the stationary expected reward is:
+
+\[
+E_\pi[r(X)]
+=
+\sum_i\pi_i r(i)
+\]
+
+The weather model uses state rewards:
+
+| State | Reward |
+|---|---:|
+| Sunny | 100 |
+| Cloudy | 60 |
+| Rainy | 20 |
+
+The expected long-run reward is calculated by multiplying each reward by its stationary probability.
+
+For an irreducible positive recurrent chain, the stationary distribution also describes the long-run proportion of time spent in each state under the ergodic theorem.
+
+## Irreducibility, Periodicity and Ergodicity
+
+These concepts describe different properties of a Markov chain.
+
+### Irreducibility
+
+A Markov chain is irreducible if every state can be reached from every other state with positive probability in some finite number of transitions.
+
+For states \(i\) and \(j\), this means:
+
+\[
+\exists n\geq0:
+(P^n)_{ij}>0
+\]
+
+Irreducibility is a communication property.
+
+The implementations represent the chain as a directed graph:
+
+- Vertices represent states.
+- Directed edges represent positive-probability transitions.
+- Graph reachability determines whether states communicate.
+
+Breadth-first search is used to examine reachability.
+
+For a chain with \(n\) states, a single graph traversal has complexity:
+
+\[
+O(n^2)
+\]
+
+when the transition matrix is examined directly.
+
+Checking reachability from every state has complexity:
+
+\[
+O(n^3)
+\]
+
+for a dense matrix representation.
+
+### Periodicity
+
+The period of a state is:
+
+\[
+d(i)=\gcd\{n\geq1:(P^n)_{ii}>0\}
+\]
+
+In an irreducible chain, every state has the same period.
+
+A chain is aperiodic when:
+
+\[
+d(i)=1
+\]
+
+An irreducible chain with period greater than one is periodic.
+
+The implementations calculate the period using graph distances and the greatest common divisor of transition-distance differences.
+
+### Ergodicity
+
+For a finite-state Markov chain, irreducibility and aperiodicity imply the existence of a unique stationary distribution and convergence toward it from every initial distribution.
+
+A finite irreducible chain is positive recurrent automatically.
+
+Under these conditions:
+
+\[
+\lim_{n\to\infty}P^n_{ij}=\pi_j
+\]
+
+The long-run empirical frequency of state \(j\) also converges to its stationary probability under the standard ergodic theorem.
+
+The weather model is irreducible because all states communicate. It is aperiodic because every state has a positive self-transition probability.
+
+### Comparison of chain structures
+
+| Property | Ergodic weather model | Periodic model | Absorbing model |
+|---|---|---|---|
+| Irreducible | Yes | Yes | No |
+| Aperiodic | Yes | No | Not applicable to the whole chain |
+| Unique stationary distribution | Yes | Yes | Yes for the supplied absorbing model |
+| Power iteration convergence | Yes | Not guaranteed | May depend on initialization and structure |
+| Convergence from every initial distribution | Yes | Not in ordinary discrete time | Yes for the supplied absorbing model |
+
+The periodic example alternates deterministically between two states:
+
+\[
+A\rightarrow B\rightarrow A
+\]
+
+Its period is two.
+
+Its stationary distribution is:
+
+\[
+\pi=(0.5,0.5)
+\]
+
+Yet a distribution concentrated entirely on state \(A\) alternates between the two states and does not converge to the stationary distribution at each individual time step.
+
+The absorbing example contains a transient state and an absorbing state. It illustrates why irreducibility must not be assumed for every stochastic model.
+
+## Martingales
+
+### Definition
+
+A martingale is a stochastic process:
+
+\[
+M_0,M_1,M_2,\ldots
+\]
+
+adapted to a filtration:
+
+\[
+\mathcal F_0\subseteq
+\mathcal F_1\subseteq
+\mathcal F_2\subseteq\cdots
+\]
+
+It satisfies three conditions:
+
+**Adaptation**
+
+\[
+M_n\text{ is }\mathcal F_n\text{-measurable}
+\]
+
+**Integrability**
+
+\[
+E[|M_n|]<\infty
+\]
+
+**Conditional expectation**
+
+\[
+E[M_{n+1}\mid\mathcal F_n]=M_n
+\]
+
+The filtration represents the information available up to each time.
+
+A martingale therefore has no predictable conditional increase or decrease based on the information currently available.
+
+### Martingale difference sequence
+
+A martingale difference sequence is:
+
+\[
+D_{n+1}=M_{n+1}-M_n
+\]
+
+Its defining conditional expectation is:
+
+\[
+E[D_{n+1}\mid\mathcal F_n]=0
+\]
+
+This is the mechanism implemented in the Python, JavaScript, C++17 and Java 17 files.
+
+### Constructing a martingale from a Markov chain
+
+Let the transition-dependent reward be:
+
+\[
+R(X_n,X_{n+1})
+\]
+
+Define its conditional expectation:
+
+\[
+g(i)=
+\sum_jP_{ij}R(i,j)
+\]
+
+The centered increment is:
+
+\[
+D_{n+1}
+=
+R(X_n,X_{n+1})-g(X_n)
+\]
+
+Define:
+
+\[
+M_0=0
+\]
+
+and:
+
+\[
+M_n=\sum_{k=0}^{n-1}D_{k+1}
+\]
+
+Then:
+
+\[
+E[D_{n+1}\mid\mathcal F_n]=0
+\]
+
+Consequently:
+
+\[
+E[M_{n+1}\mid\mathcal F_n]=M_n
+\]
+
+The implementations calculate conditional reward means directly from the transition matrix and verify that the probability-weighted expected increment is zero for each state.
+
+### Martingale versus ordinary random walk
+
+A random walk is not automatically a martingale.
+
+For a random walk:
+
+\[
+S_n=S_0+\sum_{k=1}^{n}Y_k
+\]
+
+the martingale property requires the appropriate conditional mean of each increment to be zero:
+
+\[
+E[Y_{n+1}\mid\mathcal F_n]=0
+\]
+
+If the increments have a nonzero predictable conditional mean, centering them is necessary.
+
+The Markov-chain construction provides this centering mechanism.
+
+### Martingale limitations
+
+A martingale does not imply:
+
+- Independent increments.
+- Identically distributed increments.
+- Constant variance.
+- Stationarity.
+- Almost-sure convergence without further assumptions.
+
+The conditional expectation property is the defining requirement.
+
+## Stationarity: A Separate Concept
+
+Stationarity refers to invariance of probability distributions under time shifts.
+
+For a strictly stationary process:
+
+\[
+(X_{t_1},\ldots,X_{t_k})
+\]
+
+has the same joint distribution as:
+
+\[
+(X_{t_1+h},\ldots,X_{t_k+h})
+\]
+
+for every admissible shift \(h\).
+
+A weakly stationary process requires:
+
+1. Constant finite mean.
+2. Finite variance.
+3. Autocovariance depending only on the time difference.
+
+A Markov chain initialized with its stationary distribution is strictly stationary when its transition mechanism is time-homogeneous.
+
+A chain that has not been initialized with its stationary distribution can still possess a stationary distribution without its observed process being stationary.
+
+Stationarity of a distribution must therefore be distinguished from stationarity of a particular realization.
+
+## Stochastic Simulation and Numerical Estimation
+
+### Monte Carlo estimation
+
+A stochastic simulation generates sample paths from a probability model.
+
+For a trajectory:
+
+\[
+X_0,X_1,\ldots,X_N
+\]
+
+the empirical state frequency is:
+
+\[
+\widehat{\pi}_i=
+\frac{1}{N+1}
+\sum_{t=0}^{N}
+\mathbf 1(X_t=i)
+\]
+
+For an ergodic finite-state Markov chain:
+
+\[
+\widehat{\pi}_i\rightarrow\pi_i
+\]
+
+almost surely as the simulation length increases.
+
+The simulation therefore provides an empirical approximation to the theoretical stationary distribution.
+
+### Error measurement
+
+The implementations calculate maximum absolute distribution error:
+
+\[
+E_{\max}=
+\max_i|\widehat{\pi}_i-\pi_i|
+\]
+
+The total variation distance is:
+
+\[
+d_{TV}(\pi,\widehat{\pi})
+=
+\frac12\sum_i|\pi_i-\widehat{\pi}_i|
+\]
+
+Both metrics compare theoretical and empirical distributions.
+
+They measure different aspects of distributional discrepancy.
+
+### Reproducibility
+
+A fixed random seed allows a stochastic experiment to be repeated under the same random-number generator and implementation.
+
+The Python implementation uses `random.Random`.
+
+The JavaScript implementation uses a deterministic Mulberry32 generator.
+
+The C++17 implementation uses `std::mt19937_64`.
+
+The Java 17 implementation uses `SplittableRandom`.
+
+Different languages and generators are not expected to produce identical random sequences from the same numerical seed.
+
+Reproducibility within each implementation is the relevant requirement.
+
+### Simulation versus exact computation
+
+| Method | Purpose | Main limitation |
+|---|---|---|
+| Matrix multiplication | Exact distribution propagation up to numerical precision | Matrix operations become expensive for large state spaces |
+| Stationary power iteration | Numerical stationary distribution | Periodicity can prevent convergence |
+| Monte Carlo simulation | Empirical process behavior | Sampling variability |
+| Graph reachability | Communication structure | Does not estimate transition probabilities |
+| Martingale verification | Conditional mean identity | Does not establish independence or convergence |
+
+## Implementation Architecture
+
+The five source files implement different computational perspectives on the same mathematical domain.
+
+### Python: Probability analysis and mathematical experimentation
+
+The Python program provides the most direct mathematical interface.
+
+Main components:
+
+| Component | Responsibility |
+|---|---|
+| `MarkovChain` | Transition validation, distribution evolution and simulation |
+| `StationaryResult` | Stationary solver output |
+| `MartingaleAnalyzer` | Conditional means and martingale increments |
+| `SimulationResult` | Empirical state and transition frequencies |
+| `ChainClassification` | Structural classification |
+| `compare_distributions` | Numerical comparison |
+
+The implementation uses dataclasses, enumerations, dictionaries, tuples, sets and standard-library numerical functions.
+
+Its graph algorithms use iterative traversal to avoid recursion-depth problems.
+
+### JavaScript: Event-driven stochastic execution
+
+The JavaScript implementation uses an event-driven architecture.
+
+Its main components are:
+
+| Component | Responsibility |
+|---|---|
+| `RandomGenerator` | Reproducible categorical sampling |
+| `MarkovModel` | Immutable state and transition configuration |
+| `MartingaleProcess` | Conditional reward centering |
+| `OnlineStatistics` | Incremental visit and transition counts |
+| `StochasticSimulator` | Asynchronous simulation and event publication |
+
+The simulator emits:
+
+- `started`
+- `transition`
+- `progress`
+- `completed`
+- `failed`
+
+Simulation batches periodically yield control through `setImmediate`.
+
+This avoids monopolizing the Node.js event loop during long simulations.
+
+The model configuration is validated before execution.
+
+### C++17: Numerical and graph-oriented computation
+
+The C++ implementation emphasizes efficient data structures and explicit computational control.
+
+Its main components include:
+
+| Component | Responsibility |
+|---|---|
+| `MarkovChain` | Matrix validation and state transitions |
+| `StationaryResult` | Numerical convergence reporting |
+| `SimulationResult` | Trajectory and transition counts |
+| `MartingaleAnalyzer` | Conditional reward calculations |
+| `Classification` | Ergodicity classification |
+
+The implementation uses:
+
+- `std::vector` for matrices and distributions.
+- `std::queue` for graph traversal.
+- `std::gcd` for periodicity calculations.
+- `std::discrete_distribution` for transition sampling.
+- `std::mt19937_64` for reproducible random generation.
+- Exceptions for invalid mathematical configurations.
+
+### Java 17: Enterprise stochastic modeling
+
+The Java implementation emphasizes domain separation, immutable results and service-oriented processing.
+
+Its main components include:
+
+| Component | Responsibility |
+|---|---|
+| `Transition` | Validated transition record |
+| `MarkovModel` | Immutable probability model |
+| `StationaryResult` | Stationary computation output |
+| `MartingaleService` | Martingale validation and evaluation |
+| `SimulationService` | Controlled stochastic execution |
+| `SimulationReport` | Immutable simulation result |
+| `ChainType` | Chain classification |
+| `SimulationStatus` | Simulation lifecycle |
+
+The transition model is built from explicit domain records rather than accepting an unstructured matrix as its only input.
+
+The simulation service separates model configuration, execution and reporting.
+
+### PostgreSQL: Relational stochastic modeling
+
+The database implementation stores stochastic models and their observed behavior.
+
+Its relational structure is:
+
+    stochastic_models
+          |
+          v
+      model_states
+          |
+          v
+      transitions
+          |
+          +----------------------+
+          |                      |
+          v                      v
+      simulations          probability analysis
+          |
+          v
+    trajectory_observations
+          |
+          v
+    martingale_observations
+          |
+          v
+       reporting
+
+The schema contains:
+
+| Table | Purpose |
+|---|---|
+| `stochastic_models` | Model identity and lifecycle |
+| `model_states` | State definitions and rewards |
+| `transitions` | Directed transition probabilities |
+| `simulations` | Simulation execution metadata |
+| `trajectory_observations` | Observed state sequence |
+| `martingale_observations` | Reward and centered increments |
+
+The database includes:
+
+- Primary and foreign keys.
+- Unique constraints.
+- Probability-range checks.
+- Model-specific state relationships.
+- Transition matrix validation.
+- Activation procedures.
+- Stationary distribution computation.
+- Long-run reward calculation.
+- Trajectory validation triggers.
+- Simulation completion procedures.
+- Reporting views.
+- Transaction-based sample execution.
+
+The stationary distribution function uses PL/pgSQL loops and array-based numerical calculations.
+
+It checks transition row sums before performing power iteration.
+
+The trajectory trigger verifies that every recorded transition is permitted by the model.
+
+## Database Integrity and Operational Rules
+
+### Probability integrity
+
+A transition probability must satisfy:
+
+\[
+0\leq p_{ij}\leq1
+\]
+
+The sum of outgoing probabilities must satisfy:
+
+\[
+\sum_jp_{ij}=1
+\]
+
+The individual probability constraint is enforced through a table-level check.
+
+The complete row-sum condition is enforced through the model activation procedure.
+
+This distinction is necessary because an ordinary row-level `CHECK` constraint cannot validate the aggregate of multiple transition records.
+
+### Model lifecycle
+
+The database uses the following model statuses:
+
+| Status | Meaning |
+|---|---|
+| Draft | Model configuration is being assembled |
+| Validated | Model has passed validation |
+| Active | Model is eligible for operational use |
+| Retired | Model is no longer operational |
+
+The supplied activation procedure accepts draft and validated models after verifying their transition matrices.
+
+### Simulation lifecycle
+
+A simulation follows:
+
+    CREATED
+       |
+       v
+    RUNNING
+       |
+       +----------+
+       |          |
+       v          v
+    COMPLETED   FAILED
+
+The completion procedure checks whether the number of recorded trajectory observations matches the requested number of transitions plus the initial state.
+
+The trajectory trigger also checks model membership and transition feasibility.
+
+### Transaction handling
+
+The sample workflow inserts simulation metadata, records its initial state, inserts subsequent observations and completes the simulation within a transaction.
+
+A failure during the workflow can be handled through transaction rollback.
+
+The database's transaction ensures that the sample workflow does not leave a partially committed simulation when a statement fails.
+
+## Important Edge Cases
+
+### Invalid probability matrices
+
+A matrix is invalid when:
+
+- It is not square.
+- It contains negative probabilities.
+- It contains probabilities greater than one.
+- A probability is not finite.
+- A row does not sum to one.
+
+All four programming-language implementations reject invalid matrices.
+
+### Periodic chains
+
+The alternating two-state example has period two.
+
+It has a stationary distribution, but ordinary power iteration does not converge from the uniform distribution.
+
+The implementation reports the failure to converge rather than incorrectly declaring the chain to have no stationary distribution.
+
+### Reducible chains
+
+The absorbing example contains a transient state and an absorbing state.
+
+It illustrates the possibility of non-unique stationary distributions in more general reducible models.
+
+The specific supplied absorbing model has a unique stationary distribution concentrated on its absorbing state.
+
+### Impossible observed transitions
+
+A trajectory cannot contain a transition whose probability is zero under the configured model.
+
+The database trigger rejects such observations.
+
+The programming-language implementations also validate transitions when processing martingale paths.
+
+### Numerical precision
+
+Floating-point calculations introduce rounding errors.
+
+The implementations use configurable convergence tolerances and independent stationary residual calculations.
+
+The PostgreSQL implementation uses double precision for iterative numerical calculations and numeric columns for stored transition probabilities and rewards.
+
+### Simulation length
+
+A short trajectory may produce an empirical distribution that differs substantially from its stationary distribution.
+
+Longer trajectories generally improve estimation for an ergodic model, but observations are dependent.
+
+The number of transitions is not equivalent to the number of independent observations.
+
+## Computational Complexity
+
+Let:
+
+- \(n\) be the number of states.
+- \(T\) be the number of simulated transitions.
+- \(K\) be the number of stationary iterations.
+
+For dense transition matrices:
+
+| Operation | Time complexity |
+|---|---|
+| Transition matrix validation | \(O(n^2)\) |
+| One distribution multiplication | \(O(n^2)\) |
+| Stationary power iteration | \(O(Kn^2)\) |
+| One graph traversal | \(O(n^2)\) |
+| Irreducibility checking | \(O(n^3)\) |
+| Period calculation after graph distances | \(O(n^2)\) |
+| Stochastic simulation | \(O(Tn)\) with linear categorical selection |
+| Empirical state counting | \(O(T+n)\) |
+
+The current implementations favor clarity and explicit numerical validation.
+
+For large sparse Markov chains, adjacency-list storage and sparse matrix multiplication can reduce memory and computational costs.
+
+## Security and Reliability Considerations
+
+The programs are mathematical simulation tools, not security-sensitive probability services.
+
+Their operational safeguards include:
+
+- Validation of externally supplied probabilities.
+- Rejection of invalid state references.
+- Explicit iteration limits.
+- Reproducible simulation seeds.
+- Immutable model configurations where appropriate.
+- Exception handling.
+- Numerical convergence reporting.
+- Database foreign-key enforcement.
+- Transactional simulation workflows.
+- Validation of recorded transitions.
+
+For production use, additional controls would be necessary when probability models are supplied by external users or stored in shared databases.
+
+These include access restrictions, model-version tracking, audit records, concurrency control, input-size limits and protection against resource-intensive model configurations.
+
+Random-number generator selection must also reflect the intended application. The supplied generators are appropriate for reproducible simulation experiments, not cryptographic security.
+
+## Execution
+
+### Python
+
+Requirements:
+
+- Python 3.10 or later.
+- Standard library only.
+
+Execute the complete Python source file using the Python interpreter.
+
+### JavaScript
+
+Requirements:
+
+- Node.js 18 or later.
+- No npm packages.
+
+Execute the JavaScript source file using Node.js.
+
+### C++17
+
+Requirements:
+
+- C++17-compatible compiler.
+- Standard C++ library.
+
+Compile with the C++17 language standard and execute the resulting program.
+
+### Java 17
+
+Requirements:
+
+- JDK 17 or later.
+- No third-party dependencies.
+
+The source declares `AdvancedProbability` as its public class.
+
+Compile and execute it using the Java 17 compiler and runtime.
+
+### PostgreSQL
+
+Requirements:
+
+- PostgreSQL 14 or later.
+- Permission to create schemas, tables, procedures, functions and triggers.
+
+Execute the SQL script against a PostgreSQL database.
+
+The script creates a dedicated schema and sample models. Its initial schema reset is destructive to an existing schema with the same name, so it should be executed in a dedicated learning or testing database.
+
+## Learning Outcomes and Conceptual Distinctions
+
+The implementations establish the following relationships:
+
+| Concept | Mathematical or operational role |
+|---|---|
+| Probability distribution | Describes uncertainty over possible outcomes |
+| Stochastic process | Describes random evolution over time |
+| Markov property | Restricts dependence on historical information |
+| Transition matrix | Encodes one-step conditional probabilities |
+| Stationary distribution | Describes an invariant probability vector |
+| Irreducibility | Describes communication among states |
+| Periodicity | Describes restrictions on return times |
+| Ergodicity | Supports long-run distributional convergence and frequency results |
+| Martingale | Describes a process with unchanged conditional expectation |
+| Martingale difference | Represents a zero conditional-mean increment |
+| Monte Carlo simulation | Estimates behavior through generated sample paths |
+| Numerical residual | Measures the accuracy of an approximate mathematical solution |
+
+The central distinction is that stationary distributions describe invariant probability structures, ergodicity establishes conditions for long-run convergence and time-average behavior, and martingales describe conditional expectation dynamics.
+
+These properties can coexist within the same stochastic system, but none should be substituted for another.
